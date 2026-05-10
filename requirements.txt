@@ -1,0 +1,22 @@
+# ============================================================
+# Knowledge RAG - Python Dependencies
+# Target scripts: hgnn-ragchat.py, hgnn-ingestor.py, hgnn-editor.py
+# Installation: python\python.exe -m pip install -r requirements.txt
+# ============================================================
+
+# --- GUI ---
+customtkinter==5.2.2
+
+# --- LLM (hgnn-ragchat.py) ---
+llama-cpp-python==0.3.20
+
+# --- Japanese Morphological Analysis (hgnn-ragchat.py) ---
+sudachipy==0.6.11
+SudachiDict-core==20260116
+
+# --- PDF Processing (hgnn-ingestor.py, hgnn-editor.py) ---
+pypdfium2==4.30.0
+Pillow==12.1.1
+
+# --- OCR (hgnn-ingestor.py) ---
+# ndlocr-lite==1.0.0
