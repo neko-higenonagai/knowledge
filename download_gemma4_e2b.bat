@@ -8,7 +8,7 @@ cd /d "%~dp0"
 
 echo ========================================
 echo Model Download Task
-echo Target: LFM2.5-1.2B-JP-Q8_0.gguf
+echo Target: gemma-4-E2B-it-Q4_K_M.gguf [approx. 3.08 GB]
 echo ========================================
 
 if not exist "models" (
@@ -16,8 +16,8 @@ if not exist "models" (
     mkdir models
 )
 
-set "URL=https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-GGUF/resolve/main/LFM2.5-1.2B-JP-Q8_0.gguf"
-set "DEST=models\LFM2.5-1.2B-JP-Q8_0.gguf"
+set "URL=https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf"
+set "DEST=models\gemma-4-E2B-it-Q4_K_M.gguf"
 
 if exist "%DEST%" (
     echo [SKIP] Model already exists at %DEST%
@@ -25,7 +25,7 @@ if exist "%DEST%" (
 )
 
 echo.
-echo Downloading model... [This will take time]
+echo Downloading model... [This will take time, size is 3.08 GB]
 echo URL: %URL%
 echo.
 

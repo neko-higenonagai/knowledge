@@ -1,4 +1,41 @@
-VERSION = "0.0.1"
+import warnings
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
+
+# --- Windows CUDA/cuDNN DLL優先探索の設定 ---
+import os
+import sys
+if os.name == "nt":
+    original_path = os.environ.get("PATH", "")
+    nvidia_bins = []
+    for p in sys.path:
+        if not p:
+            continue
+        nvidia_dir = os.path.join(p, "nvidia")
+        if os.path.exists(nvidia_dir):
+            for sub in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, sub, "bin")
+                if os.path.exists(bin_dir):
+                    nvidia_bins.append(bin_dir)
+                    try:
+                        os.add_dll_directory(bin_dir)
+                    except Exception:
+                        pass
+    if nvidia_bins:
+        os.environ["PATH"] = os.pathsep.join(nvidia_bins + original_path.split(os.pathsep))
+
+# --- ONNX Runtime の警告ログをグローバルに抑制するパッチ (ライセンス準拠・パッケージ変更なし) ---
+try:
+    import onnxruntime
+    _orig_session_options_init = onnxruntime.SessionOptions.__init__
+    def _patched_session_options_init(self, *args, **kwargs):
+        _orig_session_options_init(self, *args, **kwargs)
+        self.log_severity_level = 3
+    onnxruntime.SessionOptions.__init__ = _patched_session_options_init
+except Exception:
+    pass
+
+VERSION = "0.0.2"
 
 import os
 import sys
@@ -16,7 +53,8 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageTk
 
 from config_ai_common import ensure_config, resolve_rag_base_path, resolve_rag_db_path
-from rag_ft_common import SudachiNounExtractor, fts_sync_single_record, logical_path_parts
+from embedding_manager import EmbeddingManager
+from rag_ft_common import SudachiNounExtractor, fts_sync_single_record, embedding_sync_single_record, logical_path_parts, background_embedding_catchup
 
 # ===========================================================================
 # Configuration & Constants
@@ -54,6 +92,12 @@ class IndexManager:
                 UNIQUE(path, filename, page)
             )
         """)
+        # embedding カラムの追加（マイグレーション）
+        try:
+            cursor.execute("ALTER TABLE ocr_texts ADD COLUMN embedding BLOB DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+
         cursor.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS ocr_texts_fts USING fts5(
                 filename UNINDEXED,
@@ -112,10 +156,14 @@ class IndexManager:
                 match_query = " AND ".join(['"' + t.replace('"', '""') + '"' for t in tokens])
 
                 sql = f"""
-                    SELECT t.id, t.date, t.path, t.filename, t.page, t.text, bm25(ocr_texts_fts) AS score
-                    FROM ocr_texts_fts AS f
+                    SELECT t.id, t.date, t.path, t.filename, t.page, t.text, f.score
+                    FROM (
+                        SELECT rowid, bm25(ocr_texts_fts, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0) AS score
+                        FROM ocr_texts_fts
+                        WHERE text MATCH ?
+                    ) AS f
                     JOIN ocr_texts AS t ON t.id = f.rowid
-                    WHERE f.text MATCH ?
+                    WHERE 1=1
                     {filter_sql.replace("path", "t.path").replace("filename", "t.filename")}
                     ORDER BY score ASC
                     LIMIT ?
@@ -200,7 +248,7 @@ class IndexManager:
     def sync_fts_for_record(self, cursor, doc_id, filename, page, path, text):
         fts_sync_single_record(cursor, self.extractor, doc_id, filename, page, path, text)
 
-    def update_record(self, doc_id, text):
+    def update_record(self, doc_id, text, emb_manager=None):
         conn = self.ensure_db()
         cursor = conn.cursor()
         try:
@@ -217,6 +265,10 @@ class IndexManager:
                 (text, now_str, doc_id)
             )
             self.sync_fts_for_record(cursor, doc_id, filename, page, path, text)
+            
+            if emb_manager and emb_manager.is_loaded():
+                embedding_sync_single_record(cursor, emb_manager, doc_id, text)
+
             conn.commit()
             return True
         except Exception as e:
@@ -450,6 +502,7 @@ class SearchApp(ctk.CTk):
         self.base_kb_path = resolve_rag_base_path(self.config)
 
         self.index_mgr = IndexManager(str(self.db_path))
+        self.emb_manager = EmbeddingManager(self.config.get("embedding_model", "onnx-community/harrier-oss-v1-270m-ONNX"))
         self.current_doc_id = None
         self.current_file_path = None
         self.edit_mode = False
@@ -457,6 +510,14 @@ class SearchApp(ctk.CTk):
 
         self._build_ui()
         self._handle_args()
+
+        # Embedding モデルをバックグラウンドでロードし、完了後に未処理のベクトル生成をキャッチアップ
+        def load_and_catchup():
+            if self.emb_manager.is_available():
+                self.emb_manager.load_model()
+                background_embedding_catchup(str(self.db_path), self.emb_manager)
+
+        threading.Thread(target=load_and_catchup, daemon=True).start()
 
     def _set_window_icon(self):
         try:
@@ -543,13 +604,18 @@ class SearchApp(ctk.CTk):
                 if query:
                     hit_count = self._count_hits(res.get("text", ""), query, self.search_mode_var.get())
 
+                if self.search_mode_var.get() == "index":
+                    display_stat = "-"
+                else:
+                    display_stat = hit_count
+
                 # Populate treeview
                 for item in self.tree.get_children(): self.tree.delete(item)
                 self.results_data = {}
                 raw_date = res.get("date", "-") or "-"
                 display_date = raw_date[:10] if raw_date and raw_date != "-" else "-"
                 item_id = self.tree.insert("", "end", values=(
-                    hit_count, res.get("filename", ""), res.get("page", "-"), res.get("path", ""), display_date
+                    display_stat, res.get("filename", ""), res.get("page", "-"), res.get("path", ""), display_date
                 ))
                 self.results_data[item_id] = res
                 self.tree.selection_set(item_id)
@@ -706,7 +772,7 @@ class SearchApp(ctk.CTk):
             conn.close()
 
     def toggle_search_mode(self):
-        pass
+        self._render_results()
 
     def toggle_edit_mode(self):
         if not self.current_doc_id:
@@ -727,8 +793,16 @@ class SearchApp(ctk.CTk):
         if not self.current_doc_id:
             return
         new_text = self.text_preview.get("1.0", "end-1c")
-        if self.index_mgr.update_record(self.current_doc_id, new_text):
-            messagebox.showinfo("成功", "テキストを更新し、インデックスを再構築しました。")
+        
+        # バックグラウンドロードがまだ完了しておらず、かつ利用可能な場合はバックグラウンドで開始
+        if not self.emb_manager.is_loaded() and self.emb_manager.is_available():
+            def load_fallback():
+                if self.emb_manager.load_model():
+                    background_embedding_catchup(str(self.db_path), self.emb_manager)
+            threading.Thread(target=load_fallback, daemon=True).start()
+            
+        if self.index_mgr.update_record(self.current_doc_id, new_text, emb_manager=self.emb_manager):
+            messagebox.showinfo("成功", "テキストを更新し、検索インデックスを再構築しました。（ベクトル情報はバックグラウンドで同期されます）")
             self.edit_mode = False
             self.text_preview.configure(state="disabled")
             self.edit_btn.configure(text="編集開始", fg_color=["#3B8ED0", "#1F6AA5"])
@@ -833,24 +907,59 @@ class SearchApp(ctk.CTk):
         for res in results:
             res['hit_count'] = self._count_hits(res.get('text', ''), query, mode)
 
+        self.last_results = results
+        self._render_results()
+
+    def _render_results(self):
+        if not hasattr(self, "last_results"): return
+        results = self.last_results
+        search_mode = self.search_mode_var.get()
+
         def sort_key(x):
             try:
                 p = int(x.get('page') or 0)
             except ValueError:
                 p = 0
-            return (-x.get('hit_count', 0), x.get('filename') or '', p)
+            if search_mode == "index":
+                # FTS5 bm25 is negative, lower is better. Sort ascending to get most relevant first.
+                return (x.get('score', 0.0), x.get('filename') or '', p)
+            else:
+                return (-x.get('hit_count', 0), x.get('filename') or '', p)
             
         results.sort(key=sort_key)
+
+        # Determine dynamic scaling factor for BM25 score if diluted
+        bm25_scale = 1.0
+        if search_mode == "index":
+            max_abs_score = max([abs(r.get("score", 0.0)) for r in results] or [0.0])
+            if 0.0 < max_abs_score < 0.001:
+                bm25_scale = 1000000.0
+
+        if search_mode == "index":
+            self.tree.heading("hits", text="スコア")
+            self.tree.column("hits", width=60)
+        else:
+            self.tree.heading("hits", text="ヒット")
+            self.tree.column("hits", width=50)
 
         for item in self.tree.get_children(): self.tree.delete(item)
         self.results_data = {}
         for res in results:
             raw_date = res.get("date", "-") or "-"
             display_date = raw_date[:10] if raw_date and raw_date != "-" else "-"
+            
+            if search_mode == "index":
+                # Show positive representation of BM25 score (FTS5 returns negative)
+                score_val = -res.get('score', 0.0) * bm25_scale
+                display_stat = f"{score_val:.2f}"
+            else:
+                display_stat = res['hit_count']
+
             item_id = self.tree.insert("", "end", values=(
-                res['hit_count'], res.get("filename", ""), res.get("page", "-"), res.get("path", ""), display_date
+                display_stat, res.get("filename", ""), res.get("page", "-"), res.get("path", ""), display_date
             ))
             self.results_data[item_id] = res
+
         if not results:
             messagebox.showinfo("検索結果", "該当するドキュメントは見つかりませんでした。")
         else:

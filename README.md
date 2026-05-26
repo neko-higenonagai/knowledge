@@ -7,15 +7,17 @@ PDFドキュメントをNDLOCR-Lite（国立国会図書館）でOCRして、テ
 </div>
 
 NDLOCR-Lite（国立国会図書館）を使用することでOCRが以前より楽になりました。プログラムはAIに指示して作ったので、指示ミスによる動作不良があると思います。LLMによっては回答が適切でなかったり、回答がエンドレスで終わらなくて停止が必要な時もあります。PDFが頻繁に変更される用途に向いてないと思います。資料などの変更がないものが良いです。このツールは動作の正確性・完全性を保証するものではありません。使用は自己責任でお願いします。<br><br>
-動作確認のためサンプルでkbフォルダにPDFが入ってます。新規に使用するときはフォルダ内をすべて削除して、推奨の構成でフォルダを作成してPDFを置いてください。PDFを取り込むときはデータベース（DB）を新規に作成しなおして下さい。
+動作確認のためサンプルでkbフォルダにPDFが入ってます。新規に使用するときはフォルダ内をすべて削除して、推奨の構成でフォルダを作成してPDFを置いてください。PDFを取り込むときはデータベース（DB）を新規に作成しなおして下さい。<br><br>
+検索キーワードと一致したヒット数、キーワードの出現頻度を考慮した統計的な検索（BM25）、キーワード検索とベクトル検索（埋め込みモデル）を組み合わせたハイブリッド検索（RRF）のいずれかを選ぶことができます。
 
 ## アプリケーション概要
 
-Sudachiを使用してインデックス化しています。データベースはSQLiteで構成しています。LlamaIndexなどはインデックス作成に時間がかかるので使用しませんでした（良い方法があるのかもしれませんが...）。なので、あまり精度のよい検索はできてません。検索前にもllmで検索語を適正にすると良いのかも...
+本システムは、形態素解析に Sudachi と、ローカルベクトル埋め込み（Embedding）を用いたセマンティック検索を RRF (Reciprocal Rank Fusion: 相互順位融合) によってハイブリッド検索しています。これにより、ローカル環境で高速でありながら極めて精度の高いドキュメント検索を実現しています。
 
 1. **HGNN-editor (`hgnn-editor.py`)**
    - PDFのページ構成を編集（並べ替え、削除、回転、結合）するためのツールです。
    - スキャン前の書類整理や、資料の統合に役立ちます。
+   - 両面スキャン時の裏面の反転をスキップ選択による反転機能で戻します。
    - データベースの自動更新はできません。ingestorで再度更新します。
 
 <div align="center">
@@ -43,6 +45,7 @@ Sudachiを使用してインデックス化しています。データベース�
    - 関連するドキュメントを検索し、それに基づいた回答を生成します。
    - うまく検索しないときは「」または""で囲んでください。囲んだ文字はテキスト一致で検索します。
    - 前回の質問や回答したことを含めて会話が進みます。会話を進めると前回の回答の影響を受けます。回答が適切でないときは、会話をリセットしてください。
+   - 自動で会話の内容の切り替わりを検出してデータベースから検索しなおします。
 
 <div align="center">
 <img src="docs/hgnn-ragchat.png" alt="RAGChat" width="300">
@@ -50,16 +53,27 @@ Sudachiを使用してインデックス化しています。データベース�
 
 ## 動作要件
 
+> [!IMPORTANT]
+> **推奨構成（CPU）およびGPU動作に関する重要な注意点**
+>
+> - **推奨環境**: 本システムは、最も安定して動作する **「CPU環境」を推奨構成（動作保証）** としています。特別な理由がない限り、セットアップ時は「CPU のみ」を選択しての導入を強くおすすめします。
+> - **OCR処理・埋め込みのCPU固定**: 文字認識（NDLOCR-Lite）およびベクトル埋め込み（Embedding）は、GPUとライブラリの相性問題やメモリ確保の不具合を回避し、かつ極めて軽量で高速なため、GPU構成を選択した場合でも**常に安定した CPU 上で実行される設計**となっています。GPUによって高速化されるのは対話AI（LLM）の推論のみです。
+> - **GPU環境の動作性**: GPUはPC構成やドライバのバージョンによってビルドエラーが発生したり、正常に動作しなかったりする場合があります。
+> - **実機動作確認済みGPU**: 本システムにおいて実機で動作確認を行ったGPUは **「NVIDIA GeForce RTX 2060 (6GB)」のみ** です。
+> - **未検証・サポート外の環境**: Intel Iris や AMD Radeon などの環境（DirectML / Vulkanアクセラレーション）については、実機での検証を行っておらず**未検証・サポート外**となります。
+
 - Windows 11
+- **[Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/ja/visual-cpp-build-tools/) (必須)** — CPU/GPU の選択を問わず、セットアップ時の `llama-cpp-python` のコンパイルに必要です（「C++ によるデスクトップ開発」を有効にする必要があります）。
 - [WinPython 3.12 (dot版)](https://winpython.github.io/) — インストール不要のポータブルPython環境
   - 本プロジェクトは WinPython の `python/python.exe` を使用して動作確認しています
   - 通常の Python 3.12 でも動作しますが、パスの設定が必要になる場合があります
-- NDLOCR-Lite | Sudachi | llama-cpp-python | pypdfium2
+- NDLOCR-Lite | Sudachi | llama-cpp-python | pypdfium2 | ONNX Runtime (Embedding)
+  - ※ 文字認識モデル（`NDLOCR-Lite`）およびベクトル埋め込みモデル（`harrier-oss-v1-270m`）は、安全かつ安定した動作を確保するため、GPU環境であっても意図的に**CPU実行で動作するよう設計されています**（非常に軽量なため、CPUでも十分高速に動作し、クラッシュや不具合を防ぎます）。GPUによって高速化されるのは対話型AI（LLM）のみです。
 
 ## インストール
 
 CodeからZIPファイルをダウンロードして解凍した後、下記のセットアップ用 BATファイル を実行してください。<br>
-動作させるにはLLM（AIモデル）を別途ダウンロードする必要があります（約1.2GB）。
+動作させるにはLLM（AIモデル）を別途ダウンロードする必要があります。
 
 ```bash
 HGNN_setup.bat
@@ -69,17 +83,25 @@ HGNN_setup.bat
 
 ## LLM(AIモデル)のダウンロード
 
-Hugging FaceからLFM2.5-1.2B-JP-Q8_0.ggufをダウンロードします。また、modelsのフォルダに別のモデルを置けば選びなおせます。
+モデルを自動ダウンロードするためのバッチファイルが2種類用意されています。用途やお好みに合わせてダウンロードしてください。また、`models` フォルダに別の GGUF モデルを直接配置すれば、アプリの設定画面からいつでも切り替え可能です。
+
+### 1. Liquid LFM 2.5 (1.2B)
+
+超軽量で高速動作する日本語対応モデル（約1.2GB）をダウンロードします。まずは手軽に試したい場合におすすめです。
 
 ```bash
 download_model.bat
 ```
 
-次のモデルも試しました。LM Studioでダウンロードしてmodelsフォルダに置くと利用できます。
+### 2. Google Gemma 4 E2B-it (5B)
 
-- Ministral-3-3B-Instruct-2512-GGUF
-- gemma-4-E2B-it-GGUF
-- gemma-4-E4B-it-GGUF
+最新の軽量高性能・高精度な instruction-tuned モデル（Q4_K_M版、約3.08GB）をダウンロードします。より高度な対話や要約を行いたい場合におすすめです。
+
+```bash
+download_gemma4_e2b.bat
+```
+
+---
 
 ## 使い方
 
@@ -179,3 +201,21 @@ This software uses the following third-party libraries.
 - **Copyright**: Copyright (c) 国立国会図書館 (National Diet Library of Japan)
 - **URL**: https://github.com/ndl-lab/ndlocr-lite
 - **Changes**: 変更なし
+
+### ONNX Runtime
+
+- **License**: MIT
+- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
+- **URL**: https://github.com/microsoft/onnxruntime
+
+### CustomTkinter
+
+- **License**: MIT
+- **Copyright**: Copyright (c) 2021 Tom Schimansky
+- **URL**: https://github.com/TomSchimansky/CustomTkinter
+
+### harrier-oss-v1-270m-ONNX (Embedding Model)
+
+- **License**: Apache 2.0
+- **Copyright**: Copyright (c) Microsoft Corporation.
+- **URL**: https://huggingface.co/onnx-community/harrier-oss-v1-270m-ONNX

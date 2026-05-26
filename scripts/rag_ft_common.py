@@ -78,6 +78,7 @@ def fts_sync_single_record(
     cleaned_text = (text or "").replace("\r", " ").replace("\n", " ").strip()
     if not cleaned_text:
         cursor.execute("DELETE FROM ocr_texts_fts WHERE rowid = ?", (doc_id,))
+        cursor.execute("UPDATE ocr_texts SET fts_synced = 1 WHERE id = ?", (doc_id,))
         return
 
     tokens = extractor.extract_nouns(cleaned_text)
@@ -103,4 +104,73 @@ def fts_sync_single_record(
         ),
     )
     cursor.execute("UPDATE ocr_texts SET fts_synced = 1 WHERE id = ?", (doc_id,))
+
+
+def embedding_sync_single_record(
+    cursor,
+    emb_manager,
+    doc_id: int,
+    text: str | None,
+) -> None:
+    """ocr_texts の1レコードの embedding を計算して保存する。
+
+    emb_manager が None、未ロード、または sentence-transformers が
+    利用不可の場合は何もしない（FTS のみで動作するフォールバック）。
+    """
+    if emb_manager is None or not emb_manager.is_loaded():
+        return
+    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
+    if not cleaned:
+        cursor.execute("UPDATE ocr_texts SET embedding = NULL WHERE id = ?", (doc_id,))
+        return
+    blob = emb_manager.encode_to_blob(cleaned, is_query=False)
+    if blob is not None:
+        cursor.execute("UPDATE ocr_texts SET embedding = ? WHERE id = ?", (blob, doc_id))
+
+
+def background_embedding_catchup(db_path, emb_manager, status_callback=None) -> None:
+    """データベース内の embedding が NULL になっているすべてのレコードについて、
+    ベクトル埋め込み（Embedding）をバックグラウンドで一括生成してデータベースを同期する。
+    """
+    if emb_manager is None or not emb_manager.is_loaded():
+        return
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # embedding が NULL である有効なテキストレコードを取得
+        cursor.execute("SELECT id, text FROM ocr_texts WHERE text IS NOT NULL AND text != '' AND embedding IS NULL")
+        rows = cursor.fetchall()
+
+        if not rows:
+            conn.close()
+            return
+
+        if status_callback:
+            status_callback(f"未作成のベクトル生成（バックグラウンド処理）を開始します: {len(rows)} 件")
+
+        updated = 0
+        for doc_id, text in rows:
+            cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
+            if cleaned:
+                blob = emb_manager.encode_to_blob(cleaned, is_query=False)
+                if blob is not None:
+                    cursor.execute("UPDATE ocr_texts SET embedding = ? WHERE id = ?", (blob, doc_id))
+                    updated += 1
+            else:
+                cursor.execute("UPDATE ocr_texts SET embedding = NULL WHERE id = ?", (doc_id,))
+
+            # DB ロック時間を抑制するため、10件ごとにコミット
+            if updated % 10 == 0:
+                conn.commit()
+
+        conn.commit()
+        conn.close()
+
+        if status_callback and updated > 0:
+            status_callback(f"ベクトル情報の自動キャッチアップが完了しました: {updated} 件更新")
+
+    except Exception as e:
+        print(f"Error in background_embedding_catchup: {e}")
 

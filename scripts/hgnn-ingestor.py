@@ -1,4 +1,41 @@
-VERSION = "0.0.1"
+import warnings
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
+
+# --- Windows CUDA/cuDNN DLL優先探索の設定 ---
+import os
+import sys
+if os.name == "nt":
+    original_path = os.environ.get("PATH", "")
+    nvidia_bins = []
+    for p in sys.path:
+        if not p:
+            continue
+        nvidia_dir = os.path.join(p, "nvidia")
+        if os.path.exists(nvidia_dir):
+            for sub in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, sub, "bin")
+                if os.path.exists(bin_dir):
+                    nvidia_bins.append(bin_dir)
+                    try:
+                        os.add_dll_directory(bin_dir)
+                    except Exception:
+                        pass
+    if nvidia_bins:
+        os.environ["PATH"] = os.pathsep.join(nvidia_bins + original_path.split(os.pathsep))
+
+# --- ONNX Runtime の警告ログをグローバルに抑制するパッチ (ライセンス準拠・パッケージ変更なし) ---
+try:
+    import onnxruntime
+    _orig_session_options_init = onnxruntime.SessionOptions.__init__
+    def _patched_session_options_init(self, *args, **kwargs):
+        _orig_session_options_init(self, *args, **kwargs)
+        self.log_severity_level = 3
+    onnxruntime.SessionOptions.__init__ = _patched_session_options_init
+except Exception:
+    pass
+
+VERSION = "0.0.2"
 
 import os
 import sqlite3
@@ -31,7 +68,8 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageTk
 
 from config_ai_common import ensure_config, resolve_rag_base_path, resolve_rag_db_path, save_config
-from rag_ft_common import SudachiNounExtractor, fts_sync_single_record
+from embedding_manager import EmbeddingManager
+from rag_ft_common import SudachiNounExtractor, fts_sync_single_record, embedding_sync_single_record, background_embedding_catchup
 
 # サポートする拡張子
 SUPPORTED_EXTS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -99,26 +137,66 @@ class OCRManager:
                 return True
             try:
                 paths = self._get_model_paths()
+
+                # NDLOCR-LiteはCPUのみで動作させる
+                target_device = "cpu"
+
+                # 各しきい値を設定からパース（パースエラー時は既定値にフォールバック）
+                try:
+                    det_score = float(CONFIG.get("ocr_det_score_threshold", "0.2"))
+                except ValueError:
+                    det_score = 0.2
+                try:
+                    det_conf = float(CONFIG.get("ocr_det_conf_threshold", "0.25"))
+                except ValueError:
+                    det_conf = 0.25
+                try:
+                    det_iou = float(CONFIG.get("ocr_det_iou_threshold", "0.2"))
+                except ValueError:
+                    det_iou = 0.2
+
                 args = argparse.Namespace(
                     det_weights=paths["det_weights"],
                     det_classes=paths["det_classes"],
-                    det_score_threshold=0.2,
-                    det_conf_threshold=0.25,
-                    det_iou_threshold=0.2,
+                    det_score_threshold=det_score,
+                    det_conf_threshold=det_conf,
+                    det_iou_threshold=det_iou,
                     rec_weights=paths["rec_weights"],
                     rec_weights30=paths["rec_weights30"],
                     rec_weights50=paths["rec_weights50"],
                     rec_classes=paths["rec_classes"],
-                    device="cpu"
+                    device=target_device
                 )
-                self.detector = ocr.get_detector(args=args)
-                self.recognizer = ocr.get_recognizer(args=args)
-                self.recognizer30 = ocr.get_recognizer(args=args, weights_path=args.rec_weights30)
-                self.recognizer50 = ocr.get_recognizer(args=args, weights_path=args.rec_weights50)
+
+                try:
+                    self.detector = ocr.get_detector(args=args)
+                    self.recognizer = ocr.get_recognizer(args=args)
+                    self.recognizer30 = ocr.get_recognizer(args=args, weights_path=args.rec_weights30)
+                    self.recognizer50 = ocr.get_recognizer(args=args, weights_path=args.rec_weights50)
+                except Exception as gpu_err:
+                    if target_device == "cuda":
+                        print(f"OCR GPU (CUDA) Load failed, falling back to CPU: {gpu_err}")
+                        args.device = "cpu"
+                        self.detector = ocr.get_detector(args=args)
+                        self.recognizer = ocr.get_recognizer(args=args)
+                        self.recognizer30 = ocr.get_recognizer(args=args, weights_path=args.rec_weights30)
+                        self.recognizer50 = ocr.get_recognizer(args=args, weights_path=args.rec_weights50)
+                    else:
+                        raise gpu_err
+
                 return True
             except Exception as e:
                 print(f"OCR Model Load Error: {e}")
                 return False
+
+    def reset_models(self):
+        """設定変更時などに、ロード済みのOCRモデルをリセットして再ロード可能にする。"""
+        with self._lock:
+            self.detector = None
+            self.recognizer = None
+            self.recognizer30 = None
+            self.recognizer50 = None
+
 
     def run_ocr(self, pil_img):
         """PIL Image からテキストを抽出する。モデル未ロード時は subprocess にフォールバック。"""
@@ -172,12 +250,13 @@ class OCRManager:
 # ===========================================================================
 
 class PDFProcessor:
-    def __init__(self, db_path, python_exe=None):
+    def __init__(self, db_path, python_exe=None, emb_manager=None):
         self.db_path = Path(db_path)
         self.python_exe = python_exe or sys.executable
         self.stop_requested = False
         self.extractor = SudachiNounExtractor()
         self.ocr_mgr = OCRManager(self.python_exe)
+        self.emb_manager = emb_manager
 
     def ensure_db(self, force_new=False):
         db_dir = self.db_path.parent
@@ -219,6 +298,9 @@ class PDFProcessor:
                 size INTEGER,
                 UNIQUE(path, filename)
             )
+            """,
+            """
+            ALTER TABLE ocr_texts ADD COLUMN embedding BLOB DEFAULT NULL
             """,
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS ocr_texts_fts USING fts5(
@@ -300,6 +382,7 @@ class PDFProcessor:
         if row:
             doc_id = row[0]
             self.sync_fts_for_record(cursor, doc_id, filename, page, cat_path, text)
+            embedding_sync_single_record(cursor, self.emb_manager, doc_id, text)
         conn.commit()
 
     def delete_record(self, conn, cat_path, filename, page):
@@ -349,7 +432,7 @@ class PDFProcessor:
         """画像ファイル（JPEG/PNG）かどうかを判定する。"""
         return Path(filepath).suffix.lower() in {".jpg", ".jpeg", ".png"}
 
-    def process_file(self, file_path, rel_path, base_name, conn, status_callback=None, overwrite_callback=None):
+    def process_file(self, file_path, rel_path, base_name, conn, status_callback=None, overwrite_callback=None, force_overwrite=False):
         """PDFまたは画像ファイルを処理する統合エントリポイント。"""
         if self.stop_requested:
             return False, False
@@ -370,7 +453,7 @@ class PDFProcessor:
             (cat_path, filename)
         ).fetchone()
 
-        if row and row[0] == mtime and row[1] == size:
+        if not force_overwrite and row and row[0] == mtime and row[1] == size:
             if status_callback:
                 status_callback(f"  Skipped (No changes): {filename}")
             
@@ -482,6 +565,7 @@ class PDFProcessor:
             ).fetchone()[0]
         
         self.sync_fts_for_record(cursor, doc_id, filename, page_num, cat_path, text)
+        embedding_sync_single_record(cursor, self.emb_manager, doc_id, text)
 
         if status_callback:
             status_callback(("text_update", page_num, text))
@@ -551,7 +635,11 @@ class PDFProcessor:
                 else:
                     print(f"  Page {page_num}: No text found, performing OCR...")
 
-                img = page.render(scale=2.0).to_pil()
+                try:
+                    ocr_scale = float(CONFIG.get("ocr_scale", "2.0"))
+                except ValueError:
+                    ocr_scale = 2.0
+                img = page.render(scale=ocr_scale).to_pil()
                 text = self.run_ocr(img)
             else:
                 if status_callback:
@@ -580,6 +668,7 @@ class PDFProcessor:
                 ).fetchone()[0]
             
             self.sync_fts_for_record(cursor, doc_id, filename, page_num, cat_path, text)
+            embedding_sync_single_record(cursor, self.emb_manager, doc_id, text)
 
             if status_callback:
                 status_callback(("text_update", page_num, text))
@@ -838,7 +927,8 @@ class IngestApp(ctk.CTk):
         self.target_page = target_page
 
 
-        self.processor = PDFProcessor(DB_PATH, PYTHON_EXE)
+        self.emb_manager = EmbeddingManager(CONFIG.get("embedding_model", "onnx-community/harrier-oss-v1-270m-ONNX"))
+        self.processor = PDFProcessor(DB_PATH, PYTHON_EXE, emb_manager=self.emb_manager)
         self.base_dir = KB_DIR
         self.is_processing = False
         self.is_edit_mode = False
@@ -848,6 +938,13 @@ class IngestApp(ctk.CTk):
 
         self._build_ui()
         self.after(100, self.check_queue)
+
+        # Embedding モデルをバックグラウンドでロードし、完了後に未処理のベクトル生成をキャッチアップ
+        def load_and_catchup():
+            if self.emb_manager.load_model():
+                background_embedding_catchup(DB_PATH, self.emb_manager)
+
+        threading.Thread(target=load_and_catchup, daemon=True).start()
 
         if self.base_dir.exists():
             self.after(500, self._initial_load_sequence)
@@ -946,6 +1043,9 @@ class IngestApp(ctk.CTk):
         ctk.CTkButton(self.top_bar, text="変更", width=60, command=self.change_base_dir).pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="DB新規作成", width=100, command=self.create_new_db, fg_color="#A9A9A9").pack(side="left", padx=5)
 
+        # トップバーの右端に「設定」ボタンを配置
+        ctk.CTkButton(self.top_bar, text="設定", width=60, command=self.show_ocr_settings_dialog).pack(side="right", padx=5)
+
         # Main paned window
         self.paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg="#f0f0f0", sashwidth=4)
         self.paned.pack(fill="both", expand=True, padx=10, pady=5)
@@ -966,7 +1066,11 @@ class IngestApp(ctk.CTk):
 
         self.edit_mode_var = tk.BooleanVar(value=False)
         self.chk_edit_mode = ctk.CTkCheckBox(self.left_top, text="修正モード", variable=self.edit_mode_var, command=self.toggle_edit_mode)
-        self.chk_edit_mode.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky="w")
+        self.chk_edit_mode.grid(row=2, column=0, padx=10, pady=5, sticky="w")
+
+        self.force_overwrite_var = tk.BooleanVar(value=False)
+        self.chk_force_overwrite = ctk.CTkCheckBox(self.left_top, text="強制更新モード", variable=self.force_overwrite_var)
+        self.chk_force_overwrite.grid(row=2, column=1, padx=10, pady=5, sticky="w")
 
         # File list
         self.list_frame = ctk.CTkFrame(self.left_panel)
@@ -1061,6 +1165,131 @@ class IngestApp(ctk.CTk):
             self.base_dir = Path(new_dir)
             self.lbl_base_dir.configure(text=str(self.base_dir))
             save_config(CONFIG_PATH, {"rag_base_path": str(self.base_dir).replace("\\", "/")})
+
+    def show_ocr_settings_dialog(self):
+        """NDLOCR-Lite (文字認識エンジン) の詳細設定ダイアログを表示する。"""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("NDLOCR-Lite 詳細設定")
+        dialog.geometry("480x380")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+        
+        # 親ウィンドウの中央に配置
+        px = self.winfo_rootx() + (self.winfo_width() - 480) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - 380) // 2
+        dialog.geometry(f"+{px}+{py}")
+        
+        dialog.grab_set()
+
+        main_f = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_f.pack(expand=True, fill="both", padx=25, pady=25)
+
+        ctk.CTkLabel(main_f, text="NDLOCR-Lite 詳細設定", font=("Meiryo", 14, "bold")).pack(pady=(0, 15))
+
+        # 設定のロード
+        det_score_val = CONFIG.get("ocr_det_score_threshold", "0.2")
+        det_conf_val = CONFIG.get("ocr_det_conf_threshold", "0.25")
+        det_iou_val = CONFIG.get("ocr_det_iou_threshold", "0.2")
+        ocr_scale_val = CONFIG.get("ocr_scale", "2.0")
+        
+        # フォームグリッド
+        form_f = ctk.CTkFrame(main_f, fg_color="transparent")
+        form_f.pack(fill="x", pady=5)
+        form_f.grid_columnconfigure(1, weight=1)
+
+        # 1. 検出スコア
+        ctk.CTkLabel(form_f, text="検出スコア閾値 (0.0 - 1.0):", font=("Meiryo", 12)).grid(row=0, column=0, padx=10, pady=8, sticky="e")
+        entry_score = ctk.CTkEntry(form_f, width=120)
+        entry_score.insert(0, det_score_val)
+        entry_score.grid(row=0, column=1, padx=10, pady=8, sticky="w")
+
+        # 2. 検出信頼度
+        ctk.CTkLabel(form_f, text="検出信頼度閾値 (0.0 - 1.0):", font=("Meiryo", 12)).grid(row=1, column=0, padx=10, pady=8, sticky="e")
+        entry_conf = ctk.CTkEntry(form_f, width=120)
+        entry_conf.insert(0, det_conf_val)
+        entry_conf.grid(row=1, column=1, padx=10, pady=8, sticky="w")
+
+        # 3. 検出重複
+        ctk.CTkLabel(form_f, text="重複(IoU)閾値 (0.0 - 1.0):", font=("Meiryo", 12)).grid(row=2, column=0, padx=10, pady=8, sticky="e")
+        entry_iou = ctk.CTkEntry(form_f, width=120)
+        entry_iou.insert(0, det_iou_val)
+        entry_iou.grid(row=2, column=1, padx=10, pady=8, sticky="w")
+
+        # 4. 解像度（スケール）
+        ctk.CTkLabel(form_f, text="PDFレンダリング解像度 (0.5 - 5.0):", font=("Meiryo", 12)).grid(row=3, column=0, padx=10, pady=(8, 0), sticky="e")
+        entry_scale = ctk.CTkEntry(form_f, width=120)
+        entry_scale.insert(0, ocr_scale_val)
+        entry_scale.grid(row=3, column=1, padx=10, pady=(8, 0), sticky="w")
+
+        # 4.5. 解像度目安（説明ガイド）
+        lbl_scale_tip = ctk.CTkLabel(
+            form_f,
+            text="※目安: 通常 2.0 / 小さい文字は 2.5〜3.0 / 速度最優先なら 1.5",
+            font=("Meiryo", 10),
+            text_color=("gray50", "gray70")
+        )
+        lbl_scale_tip.grid(row=4, column=0, columnspan=2, padx=25, pady=(2, 6), sticky="w")
+
+        def save_settings():
+            try:
+                score = float(entry_score.get().strip())
+                conf = float(entry_conf.get().strip())
+                iou = float(entry_iou.get().strip())
+                scale = float(entry_scale.get().strip())
+                
+                if not (0.0 <= score <= 1.0) or not (0.0 <= conf <= 1.0) or not (0.0 <= iou <= 1.0):
+                    raise ValueError("閾値は 0.0 から 1.0 の範囲で指定してください。")
+                if not (0.5 <= scale <= 5.0):
+                    raise ValueError("解像度スケールは 0.5 から 5.0 の範囲で指定してください。")
+            except ValueError as ex:
+                messagebox.showerror("入力エラー", f"無効な入力値です:\n{ex}\n適切な数値および範囲内で入力してください。", parent=dialog)
+                return
+
+            # 変更の有無をチェック
+            is_changed = (
+                f"{score}" != det_score_val or
+                f"{conf}" != det_conf_val or
+                f"{iou}" != det_iou_val or
+                f"{scale}" != ocr_scale_val
+            )
+
+            if not is_changed:
+                # 変更がない場合は何もせず閉じる
+                dialog.grab_release()
+                dialog.destroy()
+                return
+
+            try:
+                new_settings = {
+                    "ocr_det_score_threshold": f"{score}",
+                    "ocr_det_conf_threshold": f"{conf}",
+                    "ocr_det_iou_threshold": f"{iou}",
+                    "ocr_scale": f"{scale}"
+                }
+
+                # 保存 & CONFIG更新
+                save_config(CONFIG_PATH, new_settings)
+                CONFIG.update(new_settings)
+
+                # モデル再ロード用リセット
+                self.processor.ocr_mgr.reset_models()
+
+                messagebox.showinfo("完了", "設定を保存しました。\nすでにロードされているモデルは、次回の実行時に再ロードされます。", parent=dialog)
+                dialog.grab_release()
+                dialog.destroy()
+            except Exception as system_err:
+                messagebox.showerror("システムエラー", f"設定の保存またはモデルのリセット中にエラーが発生しました:\n{system_err}", parent=dialog)
+
+        # ボタン
+        btn_f = ctk.CTkFrame(main_f, fg_color="transparent")
+        btn_f.pack(fill="x", pady=(20, 0))
+        
+        ctk.CTkButton(btn_f, text="保存", width=120, fg_color="SeaGreen", command=save_settings).pack(side="right", padx=10)
+        ctk.CTkButton(btn_f, text="キャンセル", width=100, fg_color="#A9A9A9", command=dialog.destroy).pack(side="right", padx=10)
+
+
+
+
 
 
     def _clear_list(self):
@@ -1359,7 +1588,7 @@ class IngestApp(ctk.CTk):
             return
         self.is_processing = True
         self.is_first_page_of_batch = True
-        self.overwrite_mode = "ask"
+        self.overwrite_mode = "always" if self.force_overwrite_var.get() else "ask"
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.processor.stop_requested = False
@@ -1441,6 +1670,7 @@ class IngestApp(ctk.CTk):
                     path, rel_path, self.base_dir.name, conn,
                     status_callback=lambda msg: self.queue.put(("status", msg)),
                     overwrite_callback=lambda f, p, path=path, rel_path=rel_path: self.wait_for_overwrite_choice(f, p, path, rel_path),
+                    force_overwrite=(self.overwrite_mode == "always"),
                 )
                 if isinstance(result, tuple):
                     success, is_skipped = result
@@ -1626,6 +1856,13 @@ class IngestApp(ctk.CTk):
                     if not self.is_edit_mode:
                         self.ocr_text.configure(state="disabled")
                     self._apply_filter() # フィルタ表示を更新（登録済みへの反映など）
+                    
+                    # 処理終了時にバックグラウンドで未作成のベクトル生成をチェックして実行
+                    threading.Thread(
+                        target=background_embedding_catchup,
+                        args=(DB_PATH, self.emb_manager),
+                        daemon=True
+                    ).start()
                     
                     if any_skipped:
                         messagebox.showinfo("完了", "処理が終了しました。\n（変更が無いためスキップされたファイルが含まれています）")

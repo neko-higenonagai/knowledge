@@ -1,0 +1,37 @@
+# config_ai.txt — hgnn-ragchat / hgnn-ingestor / hgnn-search で共有
+# 行頭が # の行はコメント。各設定は key=value（値に改行不可）。
+
+# --- LLM（hgnn-ragchat の gguf モデルと生成パラメータ）---
+model_path=W:/workspace/knowledge/models/LFM2.5-1.2B-JP-Q8_0.gguf
+system_prompt=あなたは親切なアシスタントです。日本語で丁寧に回答してください。
+max_tokens=2048
+temperature=0.7
+n_ctx=8192
+n_threads=4
+chat_format=chatml
+gpu_backend=cpu
+
+# --- RAG（SQLite DB パス・KB ルート・チャット検索の件数・スニペット長）---
+rag_db_path=../db/knowledge.db
+rag_base_path=../kb
+rag_top_k=5
+rag_max_chars=
+ranking_mode=bm25
+embedding_model=onnx-community/harrier-oss-v1-270m-ONNX
+topic_detection=off
+
+# --- OCR（NDLOCR-Lite 設定項目）---
+ocr_det_score_threshold=0.2
+ocr_det_conf_threshold=0.25
+ocr_det_iou_threshold=0.2
+ocr_device=auto
+ocr_scale=2.0
+
+# --- UI（ファイルダイアログの最終ディレクトリ・チャットの対話モード）---
+last_model_dir=../models
+last_kb_dir=
+last_editor_dir=
+interaction_mode=separate
+
+# --- その他（手動で追加したキー）---
+topic_threshold=0.65

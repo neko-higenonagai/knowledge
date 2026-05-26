@@ -1,4 +1,41 @@
-VERSION = "0.0.1"
+import warnings
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
+
+# --- Windows CUDA/cuDNN DLL優先探索の設定 ---
+import os
+import sys
+if os.name == "nt":
+    original_path = os.environ.get("PATH", "")
+    nvidia_bins = []
+    for p in sys.path:
+        if not p:
+            continue
+        nvidia_dir = os.path.join(p, "nvidia")
+        if os.path.exists(nvidia_dir):
+            for sub in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, sub, "bin")
+                if os.path.exists(bin_dir):
+                    nvidia_bins.append(bin_dir)
+                    try:
+                        os.add_dll_directory(bin_dir)
+                    except Exception:
+                        pass
+    if nvidia_bins:
+        os.environ["PATH"] = os.pathsep.join(nvidia_bins + original_path.split(os.pathsep))
+
+# --- ONNX Runtime の警告ログをグローバルに抑制するパッチ (ライセンス準拠・パッケージ変更なし) ---
+try:
+    import onnxruntime
+    _orig_session_options_init = onnxruntime.SessionOptions.__init__
+    def _patched_session_options_init(self, *args, **kwargs):
+        _orig_session_options_init(self, *args, **kwargs)
+        self.log_severity_level = 3
+    onnxruntime.SessionOptions.__init__ = _patched_session_options_init
+except Exception:
+    pass
+
+VERSION = "0.0.2"
 
 import contextlib
 import datetime
@@ -28,7 +65,8 @@ from config_ai_common import (
     resolve_rag_db_path,
     save_config,
 )
-from rag_ft_common import SudachiNounExtractor, fts_sync_single_record, logical_path_parts
+from embedding_manager import EmbeddingManager
+from rag_ft_common import SudachiNounExtractor, fts_sync_single_record, embedding_sync_single_record, logical_path_parts, background_embedding_catchup
 
 # UI settings
 SHOW_FILE_OPEN_INFO = False
@@ -194,7 +232,7 @@ class IndexManager:
             return True, "インデックスの準備が完了しました。"
 
 
-    def search(self, source_text, limit=5, cat1=None, cat2=None, cat3=None, forced_tokens=None):
+    def search(self, source_text, limit=5, cat1=None, cat2=None, cat3=None, forced_tokens=None, ranking_mode="hit_count", emb_manager=None):
         if not self.is_ready:
             return [], "", False
 
@@ -208,8 +246,9 @@ class IndexManager:
                 return [], "", False
             tokens = self.extractor.extract_nouns(source, noun_only=True)
             if not tokens:
-                return [], "", False
-            search_tokens = tokens[:30]
+                search_tokens = [source]
+            else:
+                search_tokens = tokens[:30]
         
         query_text = " ".join(search_tokens)
         
@@ -251,7 +290,7 @@ class IndexManager:
 
             if is_simple:
                 search_sql = [
-                    "SELECT id AS doc_id, filename, page, path, text, 0.0 AS score",
+                    "SELECT id AS doc_id, filename, page, path, text, embedding, 0.0 AS score",
                     "FROM ocr_texts",
                     "WHERE 1=1",
                 ]
@@ -273,31 +312,109 @@ class IndexManager:
                     item["category2"] = parts[1] if len(parts) > 1 else ""
                     results.append(item)
             else:
+                # 1. キーワード (FTS5) 検索候補の取得
+                fts_candidates = []
                 match_query = " OR ".join(self._quote_token(token) for token in search_tokens)
-                search_sql = [
-                    "SELECT t.id AS doc_id, f.filename, f.page, f.path, f.category1, f.category2, t.text, bm25(ocr_texts_fts) AS score",
-                    "FROM ocr_texts_fts AS f",
-                    "JOIN ocr_texts AS t ON t.id = f.rowid",
-                    "WHERE f.text MATCH ?",
-                ]
-                search_params = [match_query]
+                if match_query:
+                    search_sql = [
+                        "SELECT t.id AS doc_id, f.filename, f.page, f.path, f.category1, f.category2, t.text, t.embedding, f.score",
+                        "FROM (",
+                        "    SELECT rowid, filename, page, path, category1, category2, bm25(ocr_texts_fts, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0) AS score",
+                        "    FROM ocr_texts_fts",
+                        "    WHERE text MATCH ?",
+                        ") AS f",
+                        "JOIN ocr_texts AS t ON t.id = f.rowid",
+                        "WHERE 1=1",
+                    ]
+                    search_params = [match_query]
+                    search_sql.append(filter_sql.replace("path", "f.path").replace("filename", "f.filename"))
+                    search_params.extend(filter_params)
+                    search_sql.append("ORDER BY score ASC LIMIT ?")
+                    search_params.append(candidate_limit)
+                    
+                    for row in cursor.execute("\n".join(search_sql), search_params).fetchall():
+                        fts_candidates.append(dict(row))
 
-                # FTS search also needs filter (note: FTS table has category1, category2, but we'll use ocr_texts logic for consistency or translate)
-                # For simplicity, we apply filter to the base table join or just use the same logic if possible.
-                # Actually ocr_texts_fts has path and filename too.
-                
-                search_sql.append(filter_sql.replace("path", "f.path").replace("filename", "f.filename"))
-                search_params.extend(filter_params)
+                # 2. ベクトル (Embedding) セマンティック検索候補 of the candidate
+                vector_candidates = []
+                query_vec = None
+                if emb_manager is not None and emb_manager.is_loaded():
+                    query_vec = emb_manager.encode_np(source_text, is_query=True)
+                    
+                if query_vec is not None:
+                    vec_sql = [
+                        "SELECT id AS doc_id, filename, page, path, text, embedding",
+                        "FROM ocr_texts",
+                        "WHERE embedding IS NOT NULL"
+                    ]
+                    vec_params = []
+                    vec_sql.append(filter_sql)
+                    vec_params.extend(filter_params)
+                    
+                    all_rows = cursor.execute("\n".join(vec_sql), vec_params).fetchall()
+                    
+                    scored = []
+                    for row in all_rows:
+                        item = dict(row)
+                        doc_vec = emb_manager.decode_blob(item.get("embedding"))
+                        if doc_vec is not None:
+                            sim = float(emb_manager.cosine_similarity(query_vec, doc_vec))
+                            scored.append((item, sim))
+                    
+                    # 類似度の降順でソートし、上位件数を取得
+                    scored.sort(key=lambda x: x[1], reverse=True)
+                    for item, sim in scored[:candidate_limit]:
+                        parts = logical_path_parts(item.get("path"))
+                        item["category1"] = parts[0] if len(parts) > 0 else ""
+                        item["category2"] = parts[1] if len(parts) > 1 else ""
+                        item["score"] = 0.0
+                        item["vector_score"] = sim
+                        vector_candidates.append(item)
 
-                search_sql.append("ORDER BY score ASC LIMIT ?")
-                search_params.append(candidate_limit)
+                # 3. FTS と ベクトル検索結果を RRF で融合
+                if ranking_mode == "rrf" and query_vec is not None:
+                    merged_dict = {}
+                    
+                    # 順位付けマッチ
+                    fts_rank = {c["doc_id"]: i + 1 for i, c in enumerate(fts_candidates)}
+                    vector_rank = {c["doc_id"]: i + 1 for i, c in enumerate(vector_candidates)}
+                    
+                    # 二つの検索結果の和集合
+                    all_c_dicts = {}
+                    for c in fts_candidates:
+                        all_c_dicts[c["doc_id"]] = c
+                    for c in vector_candidates:
+                        all_c_dicts[c["doc_id"]] = c
+                    
+                    k = 60
+                    for doc_id, c in all_c_dicts.items():
+                        r_fts = fts_rank.get(doc_id, len(fts_candidates) + 10)
+                        r_vec = vector_rank.get(doc_id, len(vector_candidates) + 10)
+                        
+                        text = c["text"] or ""
+                        hit_count = sum(text.lower().count(token.lower()) for token in search_tokens)
+                        
+                        rrf = 1.0 / (k + r_fts) + 1.0 / (k + r_vec)
+                        c["rrf_score"] = rrf
+                        c["hit_count"] = hit_count
+                        merged_dict[doc_id] = c
+                        
+                    results = sorted(merged_dict.values(), key=lambda x: x["rrf_score"], reverse=True)
+                else:
+                    results = fts_candidates
 
-                for row in cursor.execute("\n".join(search_sql), search_params).fetchall():
-                    results.append(dict(row))
-            
             processed = []
-            for item in results[: int(limit)]:
+            for item in results:
                 text = item["text"] or ""
+                # 表示用スコアの決定 (RRFスコア -> ベクトルスコア -> BM25スコア)
+                score_val = 0.0
+                if "rrf_score" in item:
+                    score_val = item["rrf_score"]
+                elif "vector_score" in item:
+                    score_val = item["vector_score"]
+                elif item.get("score") is not None:
+                    score_val = item["score"]
+
                 processed.append(
                     {
                         "doc_id": str(item["doc_id"]),
@@ -309,14 +426,22 @@ class IndexManager:
                         "text": text,
                         "hit_count": sum(text.lower().count(token.lower()) for token in search_tokens),
                         "matched_token_count": sum(1 for token in search_tokens if token.lower() in text.lower()),
-                        "score": item["score"] if item["score"] is not None else 0.0,
+                        "score": score_val,
+                        "rrf_score": item.get("rrf_score"),
+                        "vector_score": item.get("vector_score"),
+                        "embedding_blob": item.get("embedding"),
                     }
                 )
             
-            # ヒット数（またはBM25スコア）でソートし直す
-            # ヒット数が多い順（降順）、ヒット数が同じならスコアが低い順（BM25は低いほうが良い場合があるが実装による）
-            # ここでは単純にヒット数降順を優先する
-            processed.sort(key=lambda x: x["hit_count"], reverse=True)
+            # ランキングモードに応じてソート
+            if ranking_mode == "bm25" and not is_simple:
+                # BM25 スコア昇順（FTS5 の bm25() は低いほど関連度が高い）
+                processed.sort(key=lambda x: x["score"])
+            elif ranking_mode == "rrf" and emb_manager is not None and emb_manager.is_loaded() and not is_simple:
+                pass  # Skip _rrf_rerank because results are already sorted by RRF
+            else:
+                # デフォルト: ヒット数降順
+                processed.sort(key=lambda x: x["hit_count"], reverse=True)
             
             return processed[: int(limit)], query_text, is_simple
         finally:
@@ -370,6 +495,50 @@ class IndexManager:
         finally:
             conn.close()
 
+    def _rrf_rerank(self, candidates, query_text, emb_manager, k=60):
+        """RRF (Reciprocal Rank Fusion) でヒット数・BM25・ベクトル類似度を統合リランキング。"""
+        if not candidates:
+            return candidates
+
+        # 1. ヒット数ランキング（降順）
+        by_hit = sorted(candidates, key=lambda x: x["hit_count"], reverse=True)
+        hit_rank = {id(c): i + 1 for i, c in enumerate(by_hit)}
+
+        # 2. BM25 ランキング（昇順＝低いほど良い）
+        by_bm25 = sorted(candidates, key=lambda x: x["score"])
+        bm25_rank = {id(c): i + 1 for i, c in enumerate(by_bm25)}
+
+        # 3. ベクトル類似度ランキング
+        query_vec = emb_manager.encode_np(query_text, is_query=True)
+        vec_rank = {}
+        if query_vec is not None:
+            scored = []
+            for c in candidates:
+                doc_vec = emb_manager.decode_blob(c.get("embedding_blob"))
+                if doc_vec is not None:
+                    sim = emb_manager.cosine_similarity(query_vec, doc_vec)
+                else:
+                    sim = -1.0  # embedding がない場合は最低順位
+                scored.append((c, sim))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            vec_rank = {id(c): i + 1 for i, (c, _) in enumerate(scored)}
+        else:
+            # クエリの embedding が取れない場合はベクトル順位を無視
+            vec_rank = {id(c): len(candidates) for c in candidates}
+
+        # 4. RRF スコア計算
+        for c in candidates:
+            cid = id(c)
+            rrf = (
+                1.0 / (k + hit_rank.get(cid, len(candidates)))
+                + 1.0 / (k + bm25_rank.get(cid, len(candidates)))
+                + 1.0 / (k + vec_rank.get(cid, len(candidates)))
+            )
+            c["rrf_score"] = rrf
+
+        candidates.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
+        return candidates
+
     def _ensure_support_tables(self):
         conn = sqlite3.connect(self.db_path)
         try:
@@ -407,6 +576,12 @@ class IndexManager:
             """)
             # FTS5 仮想テーブル (unicode61 tokenizer 使用)
             # 注: すでに存在する場合はエラーにならないよう CREATE VIRTUAL TABLE IF NOT EXISTS を使用
+            # embedding カラムの追加（マイグレーション）
+            try:
+                cursor.execute("ALTER TABLE ocr_texts ADD COLUMN embedding BLOB DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass
+
             try:
                 cursor.execute("""
                     CREATE VIRTUAL TABLE IF NOT EXISTS ocr_texts_fts USING fts5(
@@ -485,7 +660,7 @@ class IndexManager:
         """1件のレコードをFTSインデックスに同期する。"""
         fts_sync_single_record(cursor, self.extractor, doc_id, filename, page, path, text)
 
-    def update_record(self, doc_id, text):
+    def update_record(self, doc_id, text, emb_manager=None):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
@@ -503,6 +678,7 @@ class IndexManager:
                 (text, now_str, doc_id)
             )
             self.sync_fts_for_record(cursor, doc_id, filename, page, path, text)
+            embedding_sync_single_record(cursor, emb_manager, doc_id, text)
             conn.commit()
             return True
         finally:
@@ -554,43 +730,53 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="モデルパス:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
         self.model_path_var = tk.StringVar(value=config.get("model_path", ""))
         ctk.CTkEntry(self, textvariable=self.model_path_var).grid(
-            row=0, column=1, padx=10, pady=10, sticky="ew"
+            row=0, column=1, columnspan=2, padx=10, pady=10, sticky="ew"
         )
         ctk.CTkButton(self, text="参照", width=70, command=self.browse_model).grid(
-            row=0, column=2, padx=10, pady=10
+            row=0, column=3, padx=10, pady=10
         )
 
         ctk.CTkLabel(self, text="システムプロンプト:").grid(row=1, column=0, padx=10, pady=10, sticky="ne")
-        self.system_prompt_text = ctk.CTkTextbox(self, height=150)
-        self.system_prompt_text.grid(row=1, column=1, columnspan=2, padx=10, pady=10, sticky="ew")
+        self.system_prompt_text = ctk.CTkTextbox(self, height=100)
+        self.system_prompt_text.grid(row=1, column=1, columnspan=3, padx=10, pady=10, sticky="ew")
         self.system_prompt_text.insert("1.0", config.get("system_prompt", DEFAULT_SYSTEM_PROMPT))
 
-        ctk.CTkLabel(self, text="知識DBパス:").grid(row=2, column=0, padx=10, pady=10, sticky="e")
+        ctk.CTkLabel(self, text="知識パス:").grid(row=2, column=0, padx=10, pady=10, sticky="e")
         self.db_path_var = tk.StringVar(value=config.get("rag_db_path", "../db/knowledge.db"))
         ctk.CTkEntry(self, textvariable=self.db_path_var).grid(
             row=2, column=1, columnspan=2, padx=10, pady=10, sticky="ew"
         )
+        ctk.CTkButton(self, text="参照", width=70, command=self.browse_db_path).grid(
+            row=2, column=3, padx=10, pady=10
+        )
 
-        ctk.CTkLabel(self, text="PDFベースパス:").grid(row=3, column=0, padx=10, pady=10, sticky="e")
+        ctk.CTkLabel(self, text="PDFベース:").grid(row=3, column=0, padx=10, pady=10, sticky="e")
         self.base_path_var = tk.StringVar(value=config.get("rag_base_path", ""))
         ctk.CTkEntry(self, textvariable=self.base_path_var).grid(
-            row=3, column=1, padx=10, pady=10, sticky="ew"
+            row=3, column=1, columnspan=2, padx=10, pady=10, sticky="ew"
         )
         ctk.CTkButton(self, text="参照", width=70, command=self.browse_base_path).grid(
-            row=3, column=2, padx=10, pady=10
+            row=3, column=3, padx=10, pady=10
         )
 
         ctk.CTkLabel(self, text="検索件数:").grid(row=4, column=0, padx=10, pady=10, sticky="e")
+        frame_r4 = ctk.CTkFrame(self, fg_color="transparent")
+        frame_r4.grid(row=4, column=1, columnspan=3, sticky="w")
         self.rag_k_var = tk.StringVar(value=config.get("rag_top_k", "5"))
-        ctk.CTkEntry(self, textvariable=self.rag_k_var, width=100).grid(
-            row=4, column=1, padx=10, pady=10, sticky="w"
-        )
+        ctk.CTkEntry(frame_r4, textvariable=self.rag_k_var, width=100).pack(side="left", padx=(10, 20), pady=10)
+        ctk.CTkLabel(frame_r4, text="コンテキスト長:").pack(side="left", padx=(10, 10), pady=10)
+        self.n_ctx_var = tk.StringVar(value=config.get("n_ctx", "8192"))
+        ctk.CTkEntry(frame_r4, textvariable=self.n_ctx_var, width=120).pack(side="left", padx=(0, 10), pady=10)
 
         ctk.CTkLabel(self, text="最大文字数:").grid(row=5, column=0, padx=10, pady=10, sticky="e")
+        frame_r5 = ctk.CTkFrame(self, fg_color="transparent")
+        frame_r5.grid(row=5, column=1, columnspan=3, sticky="w")
         self.rag_max_chars_var = tk.StringVar(value=config.get("rag_max_chars", ""))
-        ctk.CTkEntry(self, textvariable=self.rag_max_chars_var, width=100).grid(
-            row=5, column=1, padx=(10, 10), pady=(10, 2), sticky="w"
-        )
+        ctk.CTkEntry(frame_r5, textvariable=self.rag_max_chars_var, width=100).pack(side="left", padx=(10, 20), pady=(10, 2))
+        ctk.CTkLabel(frame_r5, text="最大トークン数:").pack(side="left", padx=(10, 10), pady=(10, 2))
+        self.max_tokens_var = tk.StringVar(value=config.get("max_tokens", "2048"))
+        ctk.CTkEntry(frame_r5, textvariable=self.max_tokens_var, width=120).pack(side="left", padx=(0, 10), pady=(10, 2))
+
         ctk.CTkLabel(
             self,
             text="空欄なら各レコードの全文を使います",
@@ -598,22 +784,44 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color="#333333",
             anchor="w",
             justify="left",
-        ).grid(row=6, column=1, columnspan=2, padx=(10, 10), pady=(0, 8), sticky="w")
+        ).grid(row=6, column=1, columnspan=3, padx=(10, 10), pady=(0, 8), sticky="w")
 
-        ctk.CTkLabel(self, text="コンテキスト長:").grid(row=7, column=0, padx=10, pady=10, sticky="e")
-        self.n_ctx_var = tk.StringVar(value=config.get("n_ctx", "8192"))
-        ctk.CTkEntry(self, textvariable=self.n_ctx_var, width=120).grid(
-            row=7, column=1, padx=10, pady=10, sticky="w"
+        ctk.CTkLabel(self, text="ランキングモード:").grid(row=7, column=0, padx=10, pady=10, sticky="e")
+        self.ranking_mode_var = tk.StringVar(value=config.get("ranking_mode", "rrf"))
+        self.ranking_mode_menu = ctk.CTkOptionMenu(
+            self,
+            variable=self.ranking_mode_var,
+            values=["hit_count", "bm25", "rrf"],
+            width=150,
         )
+        self.ranking_mode_menu.grid(row=7, column=1, padx=10, pady=10, sticky="w")
 
-        ctk.CTkLabel(self, text="最大トークン数:").grid(row=8, column=0, padx=10, pady=10, sticky="e")
-        self.max_tokens_var = tk.StringVar(value=config.get("max_tokens", "2048"))
-        ctk.CTkEntry(self, textvariable=self.max_tokens_var, width=120).grid(
-            row=8, column=1, padx=10, pady=10, sticky="w"
+        ctk.CTkLabel(self, text="話題変更判定:").grid(row=8, column=0, padx=10, pady=10, sticky="e")
+        frame_r8 = ctk.CTkFrame(self, fg_color="transparent")
+        frame_r8.grid(row=8, column=1, columnspan=3, sticky="w")
+        self.topic_detection_var = tk.StringVar(value=config.get("topic_detection", "off"))
+        self.topic_detection_menu = ctk.CTkOptionMenu(
+            frame_r8,
+            variable=self.topic_detection_var,
+            values=["auto", "off"],
+            width=100,
         )
+        self.topic_detection_menu.pack(side="left", padx=(10, 20), pady=10)
+        ctk.CTkLabel(frame_r8, text="閾値:").pack(side="left", padx=(10, 10), pady=10)
+        self.topic_threshold_var = tk.StringVar(value=config.get("topic_threshold", "0.65"))
+        ctk.CTkEntry(frame_r8, textvariable=self.topic_threshold_var, width=120).pack(side="left", padx=(0, 10), pady=10)
+
+        ctk.CTkLabel(
+            self,
+            text="自動で話題の切り替えを判断して検索しなおします。",
+            font=("Meiryo", 13),
+            text_color="#666666",
+            anchor="w",
+            justify="left",
+        ).grid(row=9, column=1, columnspan=3, padx=(10, 10), pady=(0, 8), sticky="w")
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=9, column=0, columnspan=3, pady=(20, 20))
+        btn_frame.grid(row=10, column=0, columnspan=4, pady=(20, 20))
         ctk.CTkButton(btn_frame, text="保存", command=self.save_settings, width=120).pack(
             padx=10
         )
@@ -644,6 +852,29 @@ class SettingsWindow(ctk.CTkToplevel):
             self.model_path_var.set(filename.replace("\\", "/"))
             self.config["last_model_dir"] = os.path.dirname(filename).replace("\\", "/")
 
+    def browse_db_path(self):
+        initial_dir = self.db_path_var.get().strip() or self.config.get("rag_db_path", "")
+        if initial_dir and not os.path.isabs(initial_dir):
+            initial_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), initial_dir))
+        if os.path.isfile(initial_dir):
+            initial_dir = os.path.dirname(initial_dir)
+        filename = filedialog.askopenfilename(
+            parent=self,
+            initialdir=initial_dir or None,
+            filetypes=[("SQLite DB", "*.db"), ("All files", "*.*")],
+        )
+        self.lift()
+        self.focus()
+        if filename:
+            try:
+                relative_path = os.path.relpath(filename, os.path.dirname(__file__))
+                if not relative_path.startswith(".."):
+                    self.db_path_var.set(relative_path.replace("\\", "/"))
+                else:
+                    self.db_path_var.set(filename.replace("\\", "/"))
+            except ValueError:
+                self.db_path_var.set(filename.replace("\\", "/"))
+
     def browse_base_path(self):
         initial_dir = self.base_path_var.get().strip() or self.config.get("rag_base_path", "")
         if initial_dir and not os.path.isabs(initial_dir):
@@ -670,6 +901,10 @@ class SettingsWindow(ctk.CTkToplevel):
             "interaction_mode": self.config.get("interaction_mode", "auto"),
             "last_model_dir": self.config.get("last_model_dir", "../models"),
             "last_kb_dir": self.config.get("last_kb_dir", ""),
+            "ranking_mode": self.ranking_mode_var.get(),
+            "topic_detection": self.topic_detection_var.get(),
+            "topic_threshold": self.topic_threshold_var.get(),
+            "embedding_model": self.config.get("embedding_model", "onnx-community/harrier-oss-v1-270m-ONNX"),
         }
         self.on_save_callback(new_config)
         self.destroy()
@@ -708,8 +943,9 @@ class ChatApp(ctk.CTk):
         self._kb_index_by_name: dict[str, Path] | None = None
         self._kb_index_by_stem: dict[str, Path] | None = None
 
-        db_path = str(resolve_rag_db_path(self.config))
-        self.rag = IndexManager(db_path)
+        self.db_path = str(resolve_rag_db_path(self.config))
+        self.rag = IndexManager(self.db_path)
+        self.emb_manager = EmbeddingManager(self.config.get("embedding_model", "onnx-community/harrier-oss-v1-270m-ONNX"))
 
         self._build_header()
         self._build_filters()
@@ -1033,37 +1269,22 @@ class ChatApp(ctk.CTk):
                 self.after(0, lambda: self.append_to_chat("エラー", message))
             else:
                 if "未構築" in message or status == IndexManager.INIT_NO_DB:
-                    pass # すでに警告を出しているか、新規作成したばかり
+                    pass
                 else:
                     self.after(0, lambda: self.append_to_chat("システム", "検索インデックスの準備が完了しました。"))
 
-            # データベースが空かどうかのチェック
-            try:
-                conn = sqlite3.connect(self.rag.db_path)
-                cursor = conn.cursor()
-                # ocr_texts テーブルが存在するか確認（initializeで作成されているはず）
-                row_count = cursor.execute("SELECT COUNT(*) FROM ocr_texts").fetchone()[0]
-                if row_count == 0:
-                    self.after(0, lambda: self.append_to_chat("システム", "データベースに内容がありません。PDF読み込みアプリ を使用して PDF を読み込んでください。"))
-            except Exception:
-                pass
-            finally:
-                conn.close()
-
-            self._load_filters()
-
-            # models フォルダの作成
-            m_dir = self.config.get("last_model_dir", "").strip()
-            if m_dir:
-                try:
-                    if not os.path.isabs(m_dir):
-                        m_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), m_dir))
-                    if not os.path.exists(m_dir):
-                        os.makedirs(m_dir, exist_ok=True)
-                except Exception:
-                    pass
-
             self.initialize_model()
+
+            # Embedding モデルのロードと完了後のキャッチアップ
+            def load_and_catchup(status_cb):
+                if self.emb_manager.load_model(status_cb):
+                    background_embedding_catchup(self.db_path, self.emb_manager)
+
+            threading.Thread(
+                target=load_and_catchup,
+                args=(lambda msg: self.after(0, lambda: self.append_to_chat("システム", msg)),),
+                daemon=True
+            ).start()
         except Exception as exc:
             self.after(0, lambda exc=exc: self.append_to_chat("エラー", f"初期化エラー: {exc}"))
 
@@ -1101,7 +1322,7 @@ class ChatApp(ctk.CTk):
                         save_config(self.config_path, self.config)
                         self.after(0, lambda: self.append_to_chat("システム", f"モデルが未設定のため、最新のモデルを自動選択しました: {auto_model.name}"))
                     else:
-                        self.after(0, lambda: self.append_to_chat("システム", "AIモデルが見つかりません。LM Studio等で GGUF モデルをダウンロードし、設定から選択してください。"))
+                        self.after(0, lambda: self.append_to_chat("システム", "AIモデルが見つかりません。download_model.batを実行し、GGUF モデルをダウンロードしてから、設定からモデルを選択してください。"))
                         self.after(0, lambda: self.append_to_chat("システム", "モデルがないため、検索のみ実行可能です。"))
                         self.model_name = "None"
                         self.after(0, lambda: self.header_label.configure(text=f"使用モデル: {self.model_name}"))
@@ -1113,18 +1334,66 @@ class ChatApp(ctk.CTk):
                     self.after(0, lambda: self.header_label.configure(text=f"使用モデル: {self.model_name}"))
                     return
 
-            with open(os.devnull, "w") as fnull:
-                with contextlib.redirect_stderr(fnull):
-                    self.llm = Llama(
-                        model_path=model_path,
-                        n_ctx=parse_int_or_default(self.config.get("n_ctx", 8192), 8192),
-                        n_threads=parse_int_or_default(self.config.get("n_threads", 4), 4),
-                        chat_format=self.config.get("chat_format", "chatml"),
-                        verbose=False,
-                    )
+            # 設定から gpu_backend を読み取る
+            gpu_backend = self.config.get("gpu_backend", "cpu").lower()
+            target_layers = 0 if gpu_backend == "cpu" else -1
+
+            gpu_success = False
+            original_n_ctx = parse_int_or_default(self.config.get("n_ctx", 8192), 8192)
+            loaded_n_ctx = original_n_ctx
+
+            if target_layers != 0:
+                # VRAM容量に合わせて段階的にダウングレードしてGPUロードを再試行する
+                ctx_candidates = [original_n_ctx]
+                if original_n_ctx > 4096:
+                    ctx_candidates.append(4096)
+                if original_n_ctx > 2048:
+                    ctx_candidates.append(2048)
+                
+                # 重複を除外して順序を維持
+                seen = set()
+                retry_candidates = [x for x in ctx_candidates if not (x in seen or seen.add(x))]
+
+                for ctx_val in retry_candidates:
+                    try:
+                        with open(os.devnull, "w") as fnull:
+                            with contextlib.redirect_stderr(fnull):
+                                self.llm = Llama(
+                                    model_path=model_path,
+                                    n_ctx=ctx_val,
+                                    n_threads=parse_int_or_default(self.config.get("n_threads", 4), 4),
+                                    n_gpu_layers=target_layers,
+                                    chat_format=self.config.get("chat_format", "chatml"),
+                                    verbose=False,
+                                )
+                        gpu_success = True
+                        loaded_n_ctx = ctx_val
+                        break
+                    except Exception:
+                        continue
+
+            if not gpu_success:
+                # GPUで全滅したか、最初からCPUロード指定の場合
+                with open(os.devnull, "w") as fnull:
+                    with contextlib.redirect_stderr(fnull):
+                        self.llm = Llama(
+                            model_path=model_path,
+                            n_ctx=original_n_ctx,
+                            n_threads=parse_int_or_default(self.config.get("n_threads", 4), 4),
+                            n_gpu_layers=0,
+                            chat_format=self.config.get("chat_format", "chatml"),
+                            verbose=False,
+                        )
+
             self.model_name = os.path.basename(model_path)
             self.after(0, lambda: self.header_label.configure(text=f"使用モデル: {self.model_name}"))
-            self.after(0, lambda: self.append_to_chat("システム", "モデルを読み込みました。"))
+            if gpu_success:
+                if loaded_n_ctx < original_n_ctx:
+                    self.after(0, lambda: self.append_to_chat("システム", f"VRAM容量に合わせるため、コンテキスト長を自動的に {original_n_ctx} から {loaded_n_ctx} に縮小してGPUで読み込みました。"))
+                else:
+                    self.after(0, lambda: self.append_to_chat("システム", "モデルをGPUで読み込みました。"))
+            else:
+                self.after(0, lambda: self.append_to_chat("システム", "モデルをCPUで読み込みました。"))
         except Exception as exc:
             self.after(0, lambda exc=exc: self.append_to_chat("エラー", f"モデルエラー: {exc}"))
             self.llm = None
@@ -1419,7 +1688,7 @@ class ChatApp(ctk.CTk):
 
         self._invalidate_kb_path_index()
 
-        self.config = new_config
+        self.config.update(new_config)
         save_config(self.config_path, self.config)
 
         if reload_rag:
@@ -1541,9 +1810,25 @@ class ChatApp(ctk.CTk):
                     if context_text:
                         source_message = "検索欄に入力があるので、検索結果から回答します。"
                 else:
-                    context_text = self._refresh_rag_results(user_text, announce_source="質問内容")
-                    if context_text:
-                        source_message = "検索されたものから回答します。"
+                    # 話題判定による再検索スキップ
+                    skip_research = False
+                    if self.config.get("topic_detection", "off") == "auto" and self.emb_manager.is_loaded():
+                        threshold_val = 0.65
+                        try:
+                            threshold_val = float(self.config.get("topic_threshold", 0.65))
+                        except ValueError:
+                            pass
+                        if not self.emb_manager.should_research(user_text, self.last_search_query, threshold=threshold_val):
+                            skip_research = True
+                    
+                    if skip_research:
+                        context_text = current_editable.strip()
+                        source_message = "話題が継続しているため、前回の検索結果から回答します。"
+                        self.after(0, lambda: self.append_to_chat("システム", "（話題継続により再検索をスキップしました）"))
+                    else:
+                        context_text = self._refresh_rag_results(user_text, announce_source="質問内容")
+                        if context_text:
+                            source_message = "検索されたものから回答します。"
 
             # 検索結果が得られなかった場合のフォールバック
             if not source_message:
@@ -1633,6 +1918,8 @@ class ChatApp(ctk.CTk):
             cat2=cat2,
             cat3=cat3,
             forced_tokens=forced_tokens if forced_tokens else None,
+            ranking_mode=self.config.get("ranking_mode", "rrf"),
+            emb_manager=self.emb_manager
         )
 
         self.last_search_query = query_text
@@ -1662,10 +1949,27 @@ class ChatApp(ctk.CTk):
             ),
         )
 
+        ranking_mode = self.config.get("ranking_mode", "rrf")
+        
+        # Determine dynamic scaling factor for BM25 score if diluted
+        bm25_scale = 1.0
+        if ranking_mode == "bm25":
+            max_abs_score = max([abs(r.get("score", 0.0)) for r in results] or [0.0])
+            if 0.0 < max_abs_score < 0.001:
+                bm25_scale = 1000000.0
+
         context_parts = []
         for index, result in enumerate(results, start=1):
             clipped_text = extract_centered_text(result["text"], display_tokens, rag_max_chars)
-            meta = f"【検索結果{index}】 (ヒット数: {result['hit_count']}) / {result['filename']} / P.{result['page']} / {result['path']}"
+            
+            if ranking_mode == "bm25" and "score" in result:
+                score_info = f"BM25: {-result['score'] * bm25_scale:.2f}"
+            elif ranking_mode == "rrf" and "rrf_score" in result:
+                score_info = f"RRF: {result['rrf_score']:.4f}"
+            else:
+                score_info = f"ヒット数: {result['hit_count']}"
+
+            meta = f"【検索結果{index}】 ({score_info}) / {result['filename']} / P.{result['page']} / {result['path']}"
             context_parts.append(f"{meta}\n{clipped_text}")
 
         context_text = "\n\n---\n\n".join(context_parts).strip()
@@ -1721,10 +2025,27 @@ class ChatApp(ctk.CTk):
                 if link_tags:
                     self.kb_textbox.tag_delete(*link_tags)
 
+                ranking_mode = self.config.get("ranking_mode", "rrf")
+                
+                # Determine dynamic scaling factor for BM25 score if diluted
+                bm25_scale = 1.0
+                if ranking_mode == "bm25":
+                    max_abs_score = max([abs(r.get("score", 0.0)) for r in results] or [0.0])
+                    if 0.0 < max_abs_score < 0.001:
+                        bm25_scale = 1000000.0
+
                 for index, result in enumerate(results, start=1):
                     clipped_text = extract_centered_text(result["text"], search_tokens or [], rag_max_chars)
                     file_label = f"{result['filename']} / P.{result['page']}"
-                    header_prefix = f"【検索結果{index}】 (ヒット数: {result['hit_count']}) / "
+                    
+                    if ranking_mode == "bm25" and "score" in result:
+                        score_info = f"BM25: {-result['score'] * bm25_scale:.2f}"
+                    elif ranking_mode == "rrf" and "rrf_score" in result:
+                        score_info = f"RRF: {result['rrf_score']:.4f}"
+                    else:
+                        score_info = f"ヒット数: {result['hit_count']}"
+
+                    header_prefix = f"【検索結果{index}】 ({score_info}) / "
                     header_suffix = f" / {result['path']}\n"
 
                     resolved_path = self.resolve_result_path(result)

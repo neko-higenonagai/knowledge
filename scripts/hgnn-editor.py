@@ -1,4 +1,30 @@
-VERSION = "0.0.1"
+import warnings
+warnings.filterwarnings("ignore", message=".*urllib3.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
+
+# --- Windows CUDA/cuDNN DLL優先探索の設定 ---
+import os
+import sys
+if os.name == "nt":
+    original_path = os.environ.get("PATH", "")
+    nvidia_bins = []
+    for p in sys.path:
+        if not p:
+            continue
+        nvidia_dir = os.path.join(p, "nvidia")
+        if os.path.exists(nvidia_dir):
+            for sub in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, sub, "bin")
+                if os.path.exists(bin_dir):
+                    nvidia_bins.append(bin_dir)
+                    try:
+                        os.add_dll_directory(bin_dir)
+                    except Exception:
+                        pass
+    if nvidia_bins:
+        os.environ["PATH"] = os.pathsep.join(nvidia_bins + original_path.split(os.pathsep))
+
+VERSION = "0.0.2"
 
 import os
 import sys
@@ -12,7 +38,7 @@ from pathlib import Path
 import io
 from collections import deque
 
-from config_ai_common import ensure_config, resolve_rag_base_path
+from config_ai_common import ensure_config, resolve_rag_base_path, save_config
 
 # サポートする拡張子
 SUPPORTED_EXTS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -89,6 +115,40 @@ class DestinationDialog(ctk.CTkToplevel):
         self.result = None
         self.destroy()
 
+class ProcessingDialog(ctk.CTkToplevel):
+    def __init__(self, master, message="処理中..."):
+        super().__init__(master)
+        self.overrideredirect(True)  # タイトルバーを非表示にする
+        
+        # デザインの設定
+        self.configure(fg_color=("#F0F0F0", "#1E1E1E"))
+        
+        # 親ウィンドウの中央に配置
+        master.update_idletasks()
+        parent_x = master.winfo_x()
+        parent_y = master.winfo_y()
+        parent_w = master.winfo_width()
+        parent_h = master.winfo_height()
+        
+        w, h = 320, 120
+        x = parent_x + (parent_w - w) // 2
+        y = parent_y + (parent_h - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        
+        # 枠線とコンテナ
+        border_frame = ctk.CTkFrame(self, fg_color="transparent", border_width=2, border_color="#3B8ED0")
+        border_frame.pack(fill="both", expand=True, padx=2, pady=2)
+        
+        # メッセージ表示
+        self.label = ctk.CTkLabel(border_frame, text=message, font=("Meiryo", 16, "bold"))
+        self.label.pack(pady=(30, 5))
+        
+        self.sub_label = ctk.CTkLabel(border_frame, text="しばらくお待ちください...", font=("Meiryo", 11), text_color="gray")
+        self.sub_label.pack(pady=(0, 20))
+        
+        self.grab_set()  # モーダル化（他の操作を一時ブロック）
+        self.update()
+
 # ===========================================================================
 # PDF Management Logic
 # ===========================================================================
@@ -98,6 +158,7 @@ class PDFManager:
         self.doc = None
         self.path = None
         self.initial_bytes = None
+        self.last_added_filename = ""
         self._history_stack = deque(maxlen=UNDO_DEPTH)
 
     def load(self, path):
@@ -118,12 +179,13 @@ class PDFManager:
             with open(path, "rb") as f:
                 self.initial_bytes = f.read()
         self._history_stack.clear()
+        self.last_added_filename = ""
         self.doc = pdfium.PdfDocument(self.initial_bytes)
 
     def _save_history(self):
         out = io.BytesIO()
         self.doc.save(out)
-        self._history_stack.append(out.getvalue())
+        self._history_stack.append((out.getvalue(), self.last_added_filename))
 
     def rotate(self, page_indices, angle):
         if not self.doc: return
@@ -132,6 +194,30 @@ class PDFManager:
             page = self.doc[idx]
             new_rot = int((page.get_rotation() + angle) % 360)
             page.set_rotation(new_rot)
+
+    def is_page_cropped(self, idx):
+        if not self.doc: return False
+        page = self.doc[idx]
+        media = page.get_mediabox()
+        crop = page.get_cropbox()
+        # 微小な差は無視
+        return any(abs(m - c) > 1 for m, c in zip(media, crop))
+
+    def apply_crop(self, page_indices, rect):
+        """rect: (left, bottom, right, top) in PDF points (unrotated)"""
+        if not self.doc: return
+        self._save_history()
+        for idx in page_indices:
+            page = self.doc[idx]
+            page.set_cropbox(*rect)
+
+    def reset_crop(self, page_indices):
+        if not self.doc: return
+        self._save_history()
+        for idx in page_indices:
+            page = self.doc[idx]
+            media = page.get_mediabox()
+            page.set_cropbox(*media)
 
     def delete(self, page_indices):
         if not self.doc: return
@@ -198,6 +284,7 @@ class PDFManager:
     def insert(self, other_file_path, position_idx):
         if not self.doc: return
         self._save_history()
+        self.last_added_filename = Path(other_file_path).name
         other_path = Path(other_file_path)
         ext = other_path.suffix.lower()
         if ext in {".jpg", ".jpeg", ".png"}:
@@ -219,10 +306,11 @@ class PDFManager:
     def undo(self):
         if not self._history_stack:
             return False
-        snap = self._history_stack.pop()
+        snap_bytes, snap_filename = self._history_stack.pop()
         if self.doc:
             self.doc.close()
-        self.doc = pdfium.PdfDocument(snap)
+        self.doc = pdfium.PdfDocument(snap_bytes)
+        self.last_added_filename = snap_filename
         return True
 
     def reset(self):
@@ -231,6 +319,7 @@ class PDFManager:
                 self.doc.close()
             self.doc = pdfium.PdfDocument(self.initial_bytes)
             self._history_stack.clear()
+            self.last_added_filename = ""
             return True
         return False
 
@@ -295,6 +384,20 @@ class PDFViewer(ctk.CTkFrame):
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
 
+        self.mode = "view" # "view" or "crop"
+        self.crop_callback = None
+        self.rect_id = None
+        self.start_x = 0
+        self.start_y = 0
+
+    def set_mode(self, mode, callback=None):
+        self.mode = mode
+        self.crop_callback = callback
+        if mode == "crop":
+            self.canvas.config(cursor="crosshair")
+        else:
+            self.canvas.config(cursor="")
+
     def set_doc(self, doc, current_page=0):
         self.doc = doc
         self.current_page = min(current_page, len(doc)-1) if doc and len(doc)>0 else 0
@@ -337,14 +440,111 @@ class PDFViewer(ctk.CTkFrame):
     def zoom_in(self): self.zoom *= 1.2; self.show_page()
     def zoom_out(self): self.zoom /= 1.2; self.show_page()
     def on_press(self, e):
+        if self.mode == "crop":
+            self.start_x = self.canvas.canvasx(e.x)
+            self.start_y = self.canvas.canvasy(e.y)
+            if self.rect_id: self.canvas.delete(self.rect_id)
+            self.rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline="red", width=2)
+            return
         self.canvas.scan_mark(e.x, e.y)
         self.canvas.config(cursor="fleur")
         
     def on_drag(self, e):
+        if self.mode == "crop":
+            cur_x = self.canvas.canvasx(e.x)
+            cur_y = self.canvas.canvasy(e.y)
+            self.canvas.coords(self.rect_id, self.start_x, self.start_y, cur_x, cur_y)
+            return
         self.canvas.scan_dragto(e.x, e.y, gain=1)
         
     def on_release(self, e):
+        if self.mode == "crop":
+            end_x = self.canvas.canvasx(e.x)
+            end_y = self.canvas.canvasy(e.y)
+            self.finish_crop_selection(self.start_x, self.start_y, end_x, end_y)
+            return
         self.canvas.config(cursor="")
+
+    def finish_crop_selection(self, x1, y1, x2, y2):
+        if not self.doc or self.current_page >= len(self.doc): return
+        
+        # キャンバス上の画像位置を取得
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        page = self.doc[self.current_page]
+        bitmap = page.render(scale=self.zoom)
+        img_w, img_h = bitmap.width, bitmap.height
+        off_x, off_y = max(0, (cw - img_w)//2), max(0, (ch - img_h)//2)
+        
+        # 相対座標 (pixel)
+        rx1, ry1 = (min(x1, x2) - off_x), (min(y1, y2) - off_y)
+        rx2, ry2 = (max(x1, x2) - off_x), (max(y1, y2) - off_y)
+        
+        # PDFポイントに変換 (render時のscale=self.zoomを考慮)
+        u_x1 = rx1 / self.zoom
+        u_x2 = rx2 / self.zoom
+        u_y1 = ry1 / self.zoom
+        u_y2 = ry2 / self.zoom
+        
+        # 現在のunrotatedなcropboxを取得
+        c_left, c_bottom, c_right, c_top = page.get_cropbox()
+        rot = page.get_rotation()
+        
+        # 始点 (u_x1, u_y1) のマッピング
+        if rot == 0:
+            X1 = c_left + u_x1
+            Y1 = c_top - u_y1
+        elif rot == 90:
+            X1 = c_left + u_y1
+            Y1 = c_bottom + u_x1
+        elif rot == 180:
+            X1 = c_right - u_x1
+            Y1 = c_bottom + u_y1
+        elif rot == 270:
+            X1 = c_right - u_y1
+            Y1 = c_top - u_x1
+        else:
+            X1 = c_left + u_x1
+            Y1 = c_top - u_y1
+
+        # 終点 (u_x2, u_y2) のマッピング
+        if rot == 0:
+            X2 = c_left + u_x2
+            Y2 = c_top - u_y2
+        elif rot == 90:
+            X2 = c_left + u_y2
+            Y2 = c_bottom + u_x2
+        elif rot == 180:
+            X2 = c_right - u_x2
+            Y2 = c_bottom + u_y2
+        elif rot == 270:
+            X2 = c_right - u_y2
+            Y2 = c_top - u_x2
+        else:
+            X2 = c_left + u_x2
+            Y2 = c_top - u_y2
+
+        # 範囲を現在のcropbox境界内に収める
+        x_min = min(c_left, c_right)
+        x_max = max(c_left, c_right)
+        y_min = min(c_bottom, c_top)
+        y_max = max(c_bottom, c_top)
+        
+        X1 = max(x_min, min(x_max, X1))
+        X2 = max(x_min, min(x_max, X2))
+        Y1 = max(y_min, min(y_max, Y1))
+        Y2 = max(y_min, min(y_max, Y2))
+
+        # 新しいcropboxの算出
+        pdf_l = min(X1, X2)
+        pdf_b = min(Y1, Y2)
+        pdf_r = max(X1, X2)
+        pdf_t = max(Y1, Y2)
+        
+        if self.crop_callback:
+            self.crop_callback((pdf_l, pdf_b, pdf_r, pdf_t))
+        
+        self.set_mode("view")
+        if self.rect_id: self.canvas.delete(self.rect_id); self.rect_id = None
     def on_mousewheel(self, e):
         if e.state & 0x0004:
             if e.delta > 0: self.zoom_in()
@@ -717,6 +917,16 @@ class ThumbnailPanel(ctk.CTkScrollableFrame):
         for f, c, v in self.thumbnails:
             v.set(value)
 
+    def invert_selection(self):
+        """すべてのサムネイルの選択状態を反転する"""
+        for f, c, v in self.thumbnails:
+            v.set(not v.get())
+
+    def set_checkbox_state(self, state):
+        """チェックボックスの有効/無効を一括設定 (state='normal' or 'disabled')"""
+        for f, c, v in self.thumbnails:
+            c.configure(state=state)
+
     def highlight_page(self, idx):
         """指定したインデックスのサムネイルを強調表示し、必要ならスクロールする"""
         if not self.thumbnails or not (0 <= idx < len(self.thumbnails)):
@@ -768,7 +978,26 @@ class PDFEditorApp(ctk.CTk):
         self.geometry("1280x768")
 
         self.manager = PDFManager()
+        self.config = ensure_config(CONFIG_PATH)
+        self.last_dir = self.config.get("last_editor_dir") or str(KB_DIR)
+        if not os.path.isdir(self.last_dir):
+            self.last_dir = str(KB_DIR)
+
+        self.skip_selection_mode = False
+        self.skip_selection_first_idx = None
         self._build_ui()
+        self.bind("<Escape>", self.on_escape)
+
+    def run_with_processing(self, func, *args, message="処理中...", **kwargs):
+        dialog = ProcessingDialog(self, message=message)
+        self.update()
+        try:
+            res = func(*args, **kwargs)
+            return res
+        finally:
+            dialog.grab_release()
+            dialog.destroy()
+            self.update()
 
     def _set_window_icon(self):
         try:
@@ -799,10 +1028,17 @@ class PDFEditorApp(ctk.CTk):
         self.left_container = ctk.CTkFrame(self.paned, width=220)
         self.paned.add(self.left_container, stretch="never")
 
-        sel_ctrl = ctk.CTkFrame(self.left_container)
-        sel_ctrl.pack(fill="x", padx=5, pady=5)
-        ctk.CTkButton(sel_ctrl, text="全選択", width=90, command=lambda: self.thumb_panel.set_all(True)).pack(side="left", padx=2)
-        ctk.CTkButton(sel_ctrl, text="解除", width=90, command=lambda: self.thumb_panel.set_all(False)).pack(side="left", padx=2)
+        # Skip selection message area
+        self.skip_msg_frame = ctk.CTkFrame(self.left_container, fg_color="#CD5C5C")
+        self.skip_msg_label = ctk.CTkLabel(self.skip_msg_frame, text="", text_color="white", font=("Meiryo", 11, "bold"))
+        self.skip_msg_label.pack(pady=5)
+        # Hidden by default
+
+        self.sel_ctrl = ctk.CTkFrame(self.left_container)
+        self.sel_ctrl.pack(fill="x", padx=5, pady=5)
+        ctk.CTkButton(self.sel_ctrl, text="全選択", width=64, command=lambda: self.thumb_panel.set_all(True)).pack(side="left", padx=2)
+        ctk.CTkButton(self.sel_ctrl, text="解除", width=64, command=lambda: self.thumb_panel.set_all(False)).pack(side="left", padx=2)
+        ctk.CTkButton(self.sel_ctrl, text="反転", width=64, command=lambda: self.thumb_panel.invert_selection()).pack(side="left", padx=2)
 
         self.thumb_panel = ThumbnailPanel(self.left_container, on_select_page=self.jump_to_page, on_move_page=self.move_single_op)
         self.thumb_panel.pack(fill="both", expand=True, padx=5, pady=5)
@@ -813,23 +1049,41 @@ class PDFEditorApp(ctk.CTk):
         self.right_panel = ctk.CTkFrame(self.paned, width=220)
         self.paned.add(self.right_panel, stretch="never")
 
-        ctk.CTkLabel(self.right_panel, text="ページ", font=("Meiryo", 14, "bold")).pack(pady=10)
+        # 1. Page Operations
+        ctk.CTkLabel(self.right_panel, text="ページ操作", font=("Meiryo", 14, "bold")).pack(pady=(10, 5))
+        page_ops_frame = ctk.CTkFrame(self.right_panel)
+        page_ops_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkButton(page_ops_frame, text="選択を移動", command=self.move_multi_dialog).pack(pady=5, fill="x", padx=10)
+        ctk.CTkButton(page_ops_frame, text="選択をコピー", command=self.copy_multi_dialog).pack(pady=5, fill="x", padx=10)
+        ctk.CTkButton(page_ops_frame, text="選択を削除", fg_color="#CD5C5C", command=self.delete_op).pack(pady=5, fill="x", padx=10)
 
-        # Move / Copy buttons
-        ctk.CTkButton(self.right_panel, text="選択を移動", command=self.move_multi_dialog).pack(pady=5, fill="x", padx=10)
-        ctk.CTkButton(self.right_panel, text="選択をコピー", command=self.copy_multi_dialog).pack(pady=5, fill="x", padx=10)
-        ctk.CTkButton(self.right_panel, text="選択を削除", fg_color="#CD5C5C", command=self.delete_op).pack(pady=5, fill="x", padx=10)
+        # 2. Image Operations (Merged Selection and Rotation)
+        ctk.CTkLabel(self.right_panel, text="画像操作", font=("Meiryo", 14, "bold")).pack(pady=(20, 5))
+        img_ops_frame = ctk.CTkFrame(self.right_panel)
+        img_ops_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.auto_clear_var = tk.BooleanVar(value=True)
+        self.auto_clear_switch = ctk.CTkSwitch(img_ops_frame, text="自動解除 あり", variable=self.auto_clear_var, command=self._on_auto_clear_toggle)
+        self.auto_clear_switch.pack(pady=5)
+        
+        self.skip_sel_btn = ctk.CTkButton(img_ops_frame, text="スキップ選択", command=self.skip_selection_start)
+        self.skip_sel_btn.pack(pady=(10, 0), fill="x", padx=10)
+        ctk.CTkLabel(img_ops_frame, text="マウスで指定したページを\n一つ置きに選択します。", font=("Meiryo", 10), text_color="gray").pack(pady=(0, 10))
 
-        ctk.CTkLabel(self.right_panel, text="回転", font=("Meiryo", 14, "bold")).pack(pady=(20, 10))
-        rot_frame = ctk.CTkFrame(self.right_panel)
-        rot_frame.pack(fill="x", padx=10, pady=5)
-        ctk.CTkButton(rot_frame, text="⟲ 左回転 (90°)", command=lambda: self.rotate_op(-90)).pack(pady=2, fill="x", padx=10)
-        ctk.CTkButton(rot_frame, text="⟳ 右回転 (90°)", command=lambda: self.rotate_op(90)).pack(pady=2, fill="x", padx=10)
+        # Rotation & Crop buttons
+        ctk.CTkButton(img_ops_frame, text="⟲ 左回転 (90°)", command=lambda: self.rotate_op(-90)).pack(pady=2, fill="x", padx=10)
+        ctk.CTkButton(img_ops_frame, text="⟳ 右回転 (90°)", command=lambda: self.rotate_op(90)).pack(pady=2, fill="x", padx=10)
+        ctk.CTkButton(img_ops_frame, text="反転 (180°)", command=lambda: self.rotate_op(180)).pack(pady=2, fill="x", padx=10)
+        ctk.CTkButton(img_ops_frame, text="切り抜き (Crop)", fg_color="DarkSlateGray", command=self.crop_op).pack(pady=(10, 2), fill="x", padx=10)
 
+        # 3. Insert PDF
         ctk.CTkLabel(self.right_panel, text="PDFを挿入", font=("Meiryo", 14, "bold")).pack(pady=(20, 10))
-        ctk.CTkButton(self.right_panel, text="先頭に追加", command=lambda: self.insert_op(0)).pack(pady=2, fill="x", padx=10)
-        ctk.CTkButton(self.right_panel, text="現在位置に挿入", command=lambda: self.insert_op(self.viewer.current_page)).pack(pady=2, fill="x", padx=10)
-        ctk.CTkButton(self.right_panel, text="最後に追加", command=lambda: self.insert_op(len(self.manager.doc) if self.manager.doc else 0)).pack(pady=2, fill="x", padx=10)
+        insert_ops_frame = ctk.CTkFrame(self.right_panel)
+        insert_ops_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkButton(insert_ops_frame, text="先頭に追加", command=lambda: self.insert_op(0)).pack(pady=2, fill="x", padx=10)
+        ctk.CTkButton(insert_ops_frame, text="現在位置に挿入", command=lambda: self.insert_op(self.viewer.current_page)).pack(pady=2, fill="x", padx=10)
+        ctk.CTkButton(insert_ops_frame, text="最後に追加", command=lambda: self.insert_op(len(self.manager.doc) if self.manager.doc else 0)).pack(pady=2, fill="x", padx=10)
+
 
     # ------------------------------------------------------------------
     # Handlers
@@ -842,34 +1096,120 @@ class PDFEditorApp(ctk.CTk):
                 ("PDF files", "*.pdf"),
                 ("画像ファイル", "*.jpg *.jpeg *.png"),
             ],
-            initialdir=KB_DIR,
+            initialdir=self.last_dir,
         )
         if path:
-            self.manager.load(path)
-            self.lbl_filename.configure(text=Path(path).name)
-            self.refresh_ui(keep_page=False)
+            self._update_last_dir(path)
+            def _heavy():
+                self.manager.load(path)
+                self.refresh_ui(keep_page=False)
+            self.run_with_processing(_heavy, message="ファイルを読み込み中...")
 
-    def refresh_ui(self, keep_page=True):
+    def _update_last_dir(self, file_path):
+        new_dir = str(Path(file_path).parent)
+        self.last_dir = new_dir
+        save_config(CONFIG_PATH, {"last_editor_dir": new_dir})
+
+    def refresh_ui(self, keep_page=True, keep_selection=False):
+        # 必要なら現在の選択状態を退避
+        selected = []
+        if keep_selection:
+            selected = self.thumb_panel.get_selected_indices()
+
         current = self.viewer.current_page if keep_page else 0
         self.thumb_panel.load_doc(self.manager.doc)
         self.viewer.set_doc(self.manager.doc, current_page=current)
+        
+        # 選択状態を復元
+        if keep_selection:
+            for idx in selected:
+                if 0 <= idx < len(self.thumb_panel.thumbnails):
+                    self.thumb_panel.thumbnails[idx][2].set(True)
+
+        main_name = self.manager.path.name if (self.manager and self.manager.path) else "ファイルが選択されていません"
+        display_text = main_name
+        if self.manager.last_added_filename:
+            display_text += f" ({self.manager.last_added_filename})"
+        self.lbl_filename.configure(text=display_text)
 
     def jump_to_page(self, idx):
+        if self.skip_selection_mode:
+            if self.skip_selection_first_idx is None:
+                self.skip_selection_first_idx = idx
+                self.thumb_panel.highlight_page(idx)
+                self._set_skip_msg("【選択】 終了ページをクリック...")
+                return
+            else:
+                start = min(self.skip_selection_first_idx, idx)
+                end = max(self.skip_selection_first_idx, idx)
+                # 一つ置きに選択
+                for i in range(start, end + 1, 2):
+                    if 0 <= i < len(self.thumb_panel.thumbnails):
+                        self.thumb_panel.thumbnails[i][2].set(True)
+                self.skip_selection_mode = False
+                self.skip_selection_first_idx = None
+                self.config(cursor="")
+                self._set_skip_msg(None)
+                self.thumb_panel.set_checkbox_state("normal")
+                return
         self.viewer.current_page = idx
         self.viewer.show_page()
 
-    def move_single_op(self, src, dst):
-        self.manager.move_page(src, dst)
-        # PyMuPDFのmove_page(src, dst)でsrc < dstの場合、
-        # srcが削除された後のリストに対してdst番目の位置に挿入されるため、
-        # 移動後の実際のインデックスはdst-1（またはdstの手前）になる挙動に合わせる
-        if dst == -1:
-            self.viewer.current_page = len(self.manager.doc) - 1
-        elif src < dst:
-            self.viewer.current_page = dst - 1
+    def _on_auto_clear_toggle(self):
+        if self.auto_clear_var.get():
+            self.auto_clear_switch.configure(text="自動解除 あり")
         else:
-            self.viewer.current_page = dst
-        self.refresh_ui()
+            self.auto_clear_switch.configure(text="自動解除 なし")
+
+    def _set_skip_msg(self, text):
+        if text:
+            self.skip_msg_label.configure(text=text)
+            self.skip_msg_frame.pack(fill="x", padx=5, pady=(5, 0), before=self.sel_ctrl)
+        else:
+            self.skip_msg_frame.pack_forget()
+
+    def skip_selection_start(self):
+        self.skip_selection_mode = True
+        self.skip_selection_first_idx = None
+        self.config(cursor="cross")
+        self._set_skip_msg("【選択】 開始ページをクリック...")
+        self.thumb_panel.set_checkbox_state("disabled")
+
+    def _clear_selection_if_needed(self):
+        if self.auto_clear_var.get():
+            self.thumb_panel.set_all(False)
+
+    def _always_clear_selection(self):
+        self.thumb_panel.set_all(False)
+
+    def on_escape(self, event=None):
+        """Escキーで操作をキャンセル"""
+        if self.skip_selection_mode:
+            self.skip_selection_mode = False
+            self.skip_selection_first_idx = None
+            self._set_skip_msg(None)
+            self.thumb_panel.set_checkbox_state("normal")
+            self.config(cursor="")
+            return
+
+        if self.viewer.mode == "crop":
+            self.viewer.set_mode("view")
+            self._set_skip_msg(None)
+            self.config(cursor="")
+            return
+
+    def move_single_op(self, src, dst):
+        def _heavy():
+            self.manager.move_page(src, dst)
+            if dst == -1:
+                self.viewer.current_page = len(self.manager.doc) - 1
+            elif src < dst:
+                self.viewer.current_page = dst - 1
+            else:
+                self.viewer.current_page = dst
+            self.refresh_ui()
+            self._always_clear_selection()
+        self.run_with_processing(_heavy, message="ページを移動中...")
 
     def move_multi_dialog(self):
         indices = self.thumb_panel.get_selected_indices()
@@ -880,8 +1220,11 @@ class PDFEditorApp(ctk.CTk):
         dlg = DestinationDialog(self, len(self.manager.doc))
         self.wait_window(dlg)
         if dlg.result is not None:
-            self.manager.move_multiple_pages(indices, dlg.result)
-            self.refresh_ui()
+            def _heavy():
+                self.manager.move_multiple_pages(indices, dlg.result)
+                self.refresh_ui()
+                self._always_clear_selection()
+            self.run_with_processing(_heavy, message="ページを移動中...")
 
     def copy_multi_dialog(self):
         indices = self.thumb_panel.get_selected_indices()
@@ -892,21 +1235,73 @@ class PDFEditorApp(ctk.CTk):
         dlg = DestinationDialog(self, len(self.manager.doc), title="コピー先を指定")
         self.wait_window(dlg)
         if dlg.result is not None:
-            self.manager.copy_pages(indices, dlg.result)
-            self.refresh_ui()
+            def _heavy():
+                self.manager.copy_pages(indices, dlg.result)
+                self.refresh_ui()
+                self._always_clear_selection()
+            self.run_with_processing(_heavy, message="ページをコピー中...")
 
     def rotate_op(self, angle):
         indices = self.thumb_panel.get_selected_indices()
         if not indices: indices = [self.viewer.current_page]
-        self.manager.rotate(indices, angle)
-        self.refresh_ui()
+        def _heavy():
+            self.manager.rotate(indices, angle)
+            keep = not self.auto_clear_var.get()
+            self.refresh_ui(keep_selection=keep)
+        self.run_with_processing(_heavy, message="回転処理中...")
+
+    def crop_op(self):
+        idx = self.viewer.current_page
+        if self.manager.is_page_cropped(idx):
+            # ダイアログを表示
+            dlg = ctk.CTkToplevel(self)
+            dlg.title("切り抜き設定")
+            dlg.geometry("300x180")
+            dlg.attributes("-topmost", True)
+            
+            ctk.CTkLabel(dlg, text="このページは既に切り抜かれています", font=("Meiryo", 11, "bold")).pack(pady=10)
+            
+            def on_restore():
+                def _heavy():
+                    self.manager.reset_crop([idx])
+                    self.refresh_ui()
+                self.run_with_processing(_heavy, message="切り抜きを復元中...")
+                dlg.destroy()
+                
+            def on_reselect():
+                dlg.destroy()
+                self._start_crop_selection()
+
+            ctk.CTkButton(dlg, text="元に戻す", command=on_restore).pack(pady=5, fill="x", padx=20)
+            ctk.CTkButton(dlg, text="範囲をし直す", command=on_reselect).pack(pady=5, fill="x", padx=20)
+            ctk.CTkButton(dlg, text="キャンセル", fg_color="gray", command=dlg.destroy).pack(pady=5, fill="x", padx=20)
+        else:
+            self._start_crop_selection()
+
+    def _start_crop_selection(self):
+        self._set_skip_msg("【切抜】 範囲をマウスで指定...")
+        self.viewer.set_mode("crop", callback=self._on_crop_selected)
+
+    def _on_crop_selected(self, rect):
+        indices = self.thumb_panel.get_selected_indices()
+        if not indices: indices = [self.viewer.current_page]
+        
+        def _heavy():
+            self.manager.apply_crop(indices, rect)
+            self._set_skip_msg(None)
+            self.refresh_ui()
+            self._clear_selection_if_needed()
+        self.run_with_processing(_heavy, message="切り抜き処理中...")
 
     def delete_op(self):
         indices = self.thumb_panel.get_selected_indices()
         if not indices: indices = [self.viewer.current_page]
         if messagebox.askyesno("確認", f"{len(indices)} ページを削除しますか？"):
-            self.manager.delete(indices)
-            self.refresh_ui()
+            def _heavy():
+                self.manager.delete(indices)
+                self.refresh_ui()
+                self._always_clear_selection()
+            self.run_with_processing(_heavy, message="ページを削除中...")
 
     def insert_op(self, pos):
         path = filedialog.askopenfilename(
@@ -915,24 +1310,37 @@ class PDFEditorApp(ctk.CTk):
                 ("PDF files", "*.pdf"),
                 ("画像ファイル", "*.jpg *.jpeg *.png"),
             ],
-            initialdir=KB_DIR,
+            initialdir=self.last_dir,
         )
         if path:
-            self.manager.insert(path, pos)
-            self.refresh_ui()
+            self._update_last_dir(path)
+            def _heavy():
+                self.manager.insert(path, pos)
+                self.refresh_ui()
+                self._always_clear_selection()
+            self.run_with_processing(_heavy, message="ページを挿入中...")
 
     def undo(self):
-        if self.manager.undo(): self.refresh_ui()
-        else: messagebox.showinfo("情報", "アンドゥできる操作はありません")
+        def _heavy():
+            if self.manager.undo(): self.refresh_ui()
+            else: messagebox.showinfo("情報", "アンドゥできる操作はありません")
+        self.run_with_processing(_heavy, message="元に戻しています...")
 
     def reset(self):
         if messagebox.askyesno("確認", "最初に読み込んだ状態に戻しますか？"):
-            if self.manager.reset(): self.refresh_ui(keep_page=False)
+            def _heavy():
+                if self.manager.reset(): self.refresh_ui(keep_page=False)
+            self.run_with_processing(_heavy, message="初期状態にリセット中...")
 
     def save_file(self):
         if not self.manager.doc: return
-        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", 
+            filetypes=[("PDF files", "*.pdf")],
+            initialdir=self.last_dir
+        )
         if path:
+            self._update_last_dir(path)
             self.manager.save(path)
             messagebox.showinfo("完了", "保存しました")
 

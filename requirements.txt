@@ -1,5 +1,5 @@
 # ============================================================
-# Knowledge RAG - Python Dependencies
+# Knowledge RAG - Python Dependencies (HGNN v0.0.2)
 # Target scripts: hgnn-ragchat.py, hgnn-ingestor.py, hgnn-editor.py
 # Installation: python\python.exe -m pip install -r requirements.txt
 # ============================================================
@@ -9,6 +9,8 @@ customtkinter==5.2.2
 
 # --- LLM (hgnn-ragchat.py) ---
 llama-cpp-python==0.3.20
+diskcache>=5.6.3
+jinja2>=2.11.3
 
 # --- Japanese Morphological Analysis (hgnn-ragchat.py) ---
 sudachipy==0.6.11
@@ -18,5 +20,27 @@ SudachiDict-core==20260116
 pypdfium2==4.30.0
 Pillow==12.1.1
 
-# --- OCR (hgnn-ingestor.py) ---
-# ndlocr-lite==1.0.0
+# --- OCR (hgnn-ingestor.py / ndlocr-lite Shared Dependencies) ---
+numpy==2.2.2
+flet==0.27.6
+dill==0.3.8
+lxml==5.4.0
+networkx==3.3
+ordered-set==4.1.0
+protobuf==6.31.1
+pyparsing==3.1.2
+PyYAML==6.0.1
+tqdm==4.66.4
+reportlab==4.2.5
+opencv-python-headless==4.11.0.86
+
+# --- Embeddings & OCR ---
+requests==2.32.3
+urllib3>=1.26.0,<2.0.0
+tokenizers==0.21.0
+# Hardware-specific ONNX Runtime (CPU / GPU / DirectML) is installed in HGNN_setup.bat.
+# We set version 1.23.2 as the target to align with ndlocr-lite requirements.
+onnxruntime==1.23.2
+
+
+

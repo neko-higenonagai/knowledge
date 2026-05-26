@@ -22,9 +22,19 @@ DEFAULT_CONFIG: dict[str, str] = {
     "rag_base_path": "../kb",
     "rag_top_k": "5",
     "rag_max_chars": "",
+    "ranking_mode": "rrf",
+    "embedding_model": "onnx-community/harrier-oss-v1-270m-ONNX",
+    "topic_detection": "off",
     "last_model_dir": "../models",
     "last_kb_dir": "",
+    "last_editor_dir": "",
     "interaction_mode": "separate",
+    "gpu_backend": "cpu",
+    "ocr_det_score_threshold": "0.2",
+    "ocr_det_conf_threshold": "0.25",
+    "ocr_det_iou_threshold": "0.2",
+    "ocr_device": "auto",
+    "ocr_scale": "2.0",
 }
 
 def _parse_file_keys_only(config_path: Path) -> set[str]:
@@ -74,6 +84,7 @@ def _write_config_file(config_path: Path, config: dict[str, str]) -> None:
         "n_ctx",
         "n_threads",
         "chat_format",
+        "gpu_backend",
     )
     for key in llm_keys:
         if key in config:
@@ -84,8 +95,18 @@ def _write_config_file(config_path: Path, config: dict[str, str]) -> None:
             "# --- RAG（SQLite DB パス・KB ルート・チャット検索の件数・スニペット長）---",
         ]
     )
-    rag_keys = ("rag_db_path", "rag_base_path", "rag_top_k", "rag_max_chars")
+    rag_keys = ("rag_db_path", "rag_base_path", "rag_top_k", "rag_max_chars", "ranking_mode", "embedding_model", "topic_detection")
     for key in rag_keys:
+        if key in config:
+            lines.append(f"{key}={config[key]}")
+    lines.extend(
+        [
+            "",
+            "# --- OCR（NDLOCR-Lite 設定項目）---",
+        ]
+    )
+    ocr_keys = ("ocr_det_score_threshold", "ocr_det_conf_threshold", "ocr_det_iou_threshold", "ocr_device", "ocr_scale")
+    for key in ocr_keys:
         if key in config:
             lines.append(f"{key}={config[key]}")
     lines.extend(
@@ -94,12 +115,12 @@ def _write_config_file(config_path: Path, config: dict[str, str]) -> None:
             "# --- UI（ファイルダイアログの最終ディレクトリ・チャットの対話モード）---",
         ]
     )
-    ui_keys = ("last_model_dir", "last_kb_dir", "interaction_mode")
+    ui_keys = ("last_model_dir", "last_kb_dir", "last_editor_dir", "interaction_mode")
     for key in ui_keys:
         if key in config:
             lines.append(f"{key}={config[key]}")
 
-    known = set(llm_keys) | set(rag_keys) | set(ui_keys)
+    known = set(llm_keys) | set(rag_keys) | set(ocr_keys) | set(ui_keys)
     extra = sorted(k for k in config.keys() if k not in known)
     if extra:
         lines.extend(["", "# --- その他（手動で追加したキー）---"])
