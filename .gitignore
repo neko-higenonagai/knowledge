@@ -1,2 +1,6 @@
-script/__pycache__/**
-python/**
+script/__pycache__/
+__pycache__/
+*.py[cod]
+*$py.class
+python/
+models/
